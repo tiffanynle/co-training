@@ -7,6 +7,8 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.models import resnet50
 
+import torch.distributed as dist
+
 import numpy as np
 
 import argparse
@@ -156,7 +158,7 @@ def validate(loader, model, loss_fn, device):
     print(f"validation error:\n accuracy: {(100*correct):>0.1f}%, avg loss: {val_loss:>8f}")
     return val_loss
 
-def main(args):
+def training_process(args, rank, world_size):
     with open('cotraining_samples_lists_fixed.pkl', 'rb') as fp:
         data = pickle.load(fp)
 
@@ -202,7 +204,7 @@ def main(args):
     data_test1 = copy.deepcopy(data_train1)
     data_test1.samples = samples_test1
 
-    batch_size = 64
+    batch_size = args.batch_size
     loader_train0 = DataLoader(data_train0, batch_size, False)
     loader_unlbl0 = DataLoader(data_unlbl0, batch_size, False)
     loader_val0 = DataLoader(data_val0, batch_size, False)
@@ -228,28 +230,24 @@ def main(args):
     scheduler0 = ReduceLROnPlateau(optimizer0)
     scheduler1 = ReduceLROnPlateau(optimizer1)
 
+    # return dict of states, metrics
 
-    # co-training loop while there's still stuff in the unlabeled pools, probably
-    while len(loader_unlbl0.dataset) > 0 and len(unloader_unlbl1.dataset) > 0:
-        # train loop with validation, probably
-        for t in range(args.epochs):
-            pass
-        for t in range(args.epochs):
-            pass
+def setup(rank, world_size):
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-    # print("training model0...")
-    # for t in range(args.epochs):
-    #     print(f"epoch {t+1}\n------------------------------")
-    #     train(loader_train0, model0, loss_fn, optimizer0, device)
-    #     val_loss = validate(loader_val0, model0, loss_fn, device)
-    #     scheduler0.step(val_loss)
-        
-    # print("\ntraining model1...")
-    # for t in range(args.epochs):
-    #     print(f"epoch {t+1}\n------------------------------")
-    #     train(loader_train1, model1, loss_fn, optimizer1, device)
-    #     val_loss = validate(loader_val1, model1, loss_fn, device)
-    #     scheduler1.step(val_loss)  
+def cleanup():
+    dist.destroy_process_group()
+
+def main(args, rank, world_size):
+
+    setup(rank, world_size)
+
+    states, metric = training_process(args, rank, world_size)
+
+    if rank == 0:
+        torch.save(states, '/home/tiffanyle/state.pth')
+
+    cleanup()
         
 def create_parser():
     parser = argparse.ArgumentParser(description='co-training')
@@ -269,8 +267,6 @@ def create_parser():
 if __name__ == '__main__':
     parser = create_parser()
     args = parser.parse_args()
-
-    random.seed(13)
     
     main(args)
     
