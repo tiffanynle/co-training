@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.optim import SGD
+import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
@@ -8,16 +8,23 @@ from torchvision import datasets, transforms
 from torchvision.models import resnet50
 
 import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+)
 
 import numpy as np
 
 import argparse
+import functools
 import pickle
 import copy
 import random
 from math import floor
 
-from utils import add_to_imageloader, train_test_split_samples
+from utils import add_to_imagefolder, train_test_split_samples
 
 # takes in a Tensor of shape e.g. (# instances, # prob outputs) and returns a tuple
 # (Tensor[top probabilities], Tensor[predicted labels], Tensor[instance indexes])
@@ -65,20 +72,34 @@ def remove_collisions(lbl_model0, lbl_model1, idx_model0, idx_model1):
 
     return lbl_model0, lbl_model1, idx_model0, idx_model1
 
+def predict(loader, model, rank):
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for X, y in loader:
+            X, y = X.to(rank % torch.cuda.device_count()), y.to(rank % torch.cuda.device_count())
+            output = model(X)
+            predictions.append(output)
+    return torch.cat(predictions) # output shape (# instances, # outputs)
+
 # train two models on two different views
 # then add top k% of predictions on the unlabeled set
 # to the labeled datasets
 def cotrain(loader0, loader1, loader_unlbl,
-            model0, model1, loss_fn, optimizer0, optimizer1,
-            k, device):
+            model0, model1, k, device):
+
+    pred_model0 = predict(loader_unlbl, model0, device)
+    pred_model1 = predict(loader_unlbl, model1, device)
 
     # get top-k predictions (labels, instance indexes in the dataset)
     _, lbl_topk0, idx_topk0 = get_topk_pred(
                                     pred_model0,
-                                    k if k <= len(pred_model0) else len(pred_model0))
+                                    k if k <= len(pred_model0) 
+                                    else len(pred_model0))
     _, lbl_topk1, idx_topk1 = get_topk_pred(
                                     pred_model1, 
-                                    k if k <= len(pred_model1) else len(pred_model1))
+                                    k if k <= len(pred_model1) 
+                                    else len(pred_model1))
 
     print(f"Number of unlabeled instances: {len(loader_unlbl.dataset)}")
 
@@ -109,54 +130,51 @@ def cotrain(loader0, loader1, loader_unlbl,
     list_unlbl = [(str(a[0]), int(a[1])) for a in list(samples_unlbl)]
     loader_unlbl.dataset.samples = list_unlbl
 
-def train(loader, model, loss_fn, optimizer, device):
-    size = len(loader.dataset)
-    num_batches = len(loader)
+def train(args, rank, world_size, loader, model, optimizer, epoch,
+          sampler=None):
     model.train()
-    train_loss, correct = 0, 0
+    loss_fn = nn.CrossEntropyLoss()
+    if sampler:
+        sampler.set_epoch(epoch)
+    ddp_loss = torch.zeros(3).to(rank % torch.cuda.device_count())
     for batch, (X, y) in enumerate(loader):
-        X, y = X.to(device), y.to(device)
-
-        # Zero out the gradients
+        X, y = X.to(rank % torch.cuda.device_count()), y.to(rank % torch.cuda.device_count())
         optimizer.zero_grad()
-        
-        # Compute prediction error
-        pred = model(X)
-        loss = loss_fn(pred, y)
-        
-        train_loss += loss.item()
-        correct += (pred.argmax(1) == y).type(torch.float).sum().item()
-
-        # Backpropagation
+        output = model(X)
+        loss = loss_fn(output, y)
         loss.backward()
         optimizer.step()
-        
-        if batch % 5 == 0:
-            current = (batch + 1) * len(X)
-            print(f"loss: {loss:>7f} [{current:5d} / {size:>5d}]")
+        ddp_loss[0] += loss.item()
+        ddp_loss[1] += (output.argmax(1) == y).type(torch.float).sum().item()
+        ddp_loss[2] += len(batch)
+    
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
 
-    train_loss /= num_batches
-    correct /= size
+    if rank == 0:
+        print('Train Epoch: {} \tAccuracy: {:.2f}% \tLoss: {:.6f}'
+              .format(epoch, 
+                      100*(ddp_loss[1] / ddp_loss[2]), 
+                      ddp_loss[0] / ddp_loss[2]))
 
-    print(f"train error:\n accuracy {(100*correct):>0.1f}%, avg loss: {train_loss:>8f}")
 
-def validate(loader, model, loss_fn, device):
-    size = len(loader.dataset)
-    num_batches = len(loader)
+def test(args, rank, world_size, loader, model):
     model.eval()
-    val_loss, correct = 0, 0
-    with torch.no_grad():
-        for X, y in loader:
-            X, y = X.to(device), y.to(device)
-            pred = model(X)
-            val_loss += loss_fn(pred, y).item()
-            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
-            
-    val_loss /= num_batches
-    correct /= size
+    loss_fn = torch.nn.CrossEntropyLoss()
+    ddp_loss = torch.zeros(3).to(rank % torch.cuda.device_count())
+    for batch, (X, y) in enumerate(loader):
+        X, y = X.to(rank % torch.cuda.device_count()), y.to(rank % torch.cuda.device_count())
+        output = model(X)
+        loss = loss_fn(output, y)
+        ddp_loss[0] += loss.item()
+        ddp_loss[1] += (output.argmax(1) == y).type(torch.float).sum().item()
+        ddp_loss[2] += len(batch)
+    
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
 
-    print(f"validation error:\n accuracy: {(100*correct):>0.1f}%, avg loss: {val_loss:>8f}")
-    return val_loss
+    if rank == 0:
+        print('Test error: \tAccuracy: {:.2f}% \tAverage loss: {:.6f}'
+              .format(100*(ddp_loss[1] / ddp_loss[2]), 
+                      ddp_loss[0] / ddp_loss[2]))
 
 def training_process(args, rank, world_size):
     with open('cotraining_samples_lists_fixed.pkl', 'rb') as fp:
@@ -176,13 +194,14 @@ def training_process(args, rank, world_size):
         train_test_split_samples(samples_train0, samples_train1,
                                  test_size=0.125, random_state=13)
 
+    # ResNet50 wants 224x224 images
     trans = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
     transforms.ToTensor()
     ])
 
-    # dataset and dataloader stuff here (I need 8 of them) ... what a mess
+    # Create ImageFolder objects/datasets for first view
     data_train0 = datasets.ImageFolder('/ourdisk/hpc/ai2es/jroth/data/labeled', transform=trans)
     data_train0.class_to_idx = data['class_map']
     data_train0.classes = list(data['class_map'].keys())
@@ -194,6 +213,7 @@ def training_process(args, rank, world_size):
     data_test0 = copy.deepcopy(data_train0)
     data_test0.samples = samples_test0
 
+    # Create ImageFolder objects/datasets for second view
     data_train1 = copy.deepcopy(data_train0)
     data_train1.root = '/ourdisk/hpc/ai2es'
     
@@ -203,6 +223,14 @@ def training_process(args, rank, world_size):
     data_val1.samples = samples_val1
     data_test1 = copy.deepcopy(data_train1)
     data_test1.samples = samples_test1
+
+    auto_wrap_policy = functools.partial(
+        size_based_auto_wrap_policy, min_num_params=10_000_000
+    )
+
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+
+    # TODO define some dictionaries to do dict unpacking
 
     batch_size = args.batch_size
     loader_train0 = DataLoader(data_train0, batch_size, False)
@@ -215,22 +243,23 @@ def training_process(args, rank, world_size):
     loader_val1 = DataLoader(data_val1, batch_size, False)
     loader_test1 = DataLoader(data_test1, batch_size, False)
 
-    device = torch.device("cuda" 
-                          if torch.cuda.is_available()
-                          else "cpu")
-    print(f"using {device}")
+    # device = torch.device("cuda" 
+    #                       if torch.cuda.is_available()
+    #                       else "cpu")
+    # print(f"using {device}")
 
-    model0, model1 = resnet50().to(device), resnet50().to(device)
+    model0, model1 = resnet50(), resnet50()
+
+    model0.to(rank % torch.cuda.device_count())
+    model1.to(rank % torch.cuda.device_count())
     
-    loss_fn = nn.CrossEntropyLoss()
-    
-    optimizer0 = SGD(model0.parameters(), lr=args.lr, momentum=args.momentum)
-    optimizer1 = SGD(model1.parameters(), lr=args.lr, momentum=args.momentum)
+    optimizer0 = optim.SGD(model0.parameters(), lr=args.lr, momentum=args.momentum)
+    optimizer1 = optim.SGD(model1.parameters(), lr=args.lr, momentum=args.momentum)
     
     scheduler0 = ReduceLROnPlateau(optimizer0)
     scheduler1 = ReduceLROnPlateau(optimizer1)
 
-    # return dict of states, metrics
+    # TODO return dict of states, metrics
 
 def setup(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -245,7 +274,7 @@ def main(args, rank, world_size):
     states, metric = training_process(args, rank, world_size)
 
     if rank == 0:
-        torch.save(states, '/home/tiffanyle/state.pth')
+        torch.save(states, '/home/scratch/tiffanyle/cotraining/state.pth')
 
     cleanup()
         
