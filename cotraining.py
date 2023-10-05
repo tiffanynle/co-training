@@ -74,24 +74,23 @@ def remove_collisions(lbl_model0, lbl_model1, idx_model0, idx_model1):
 
     return lbl_model0, lbl_model1, idx_model0, idx_model1
 
-def predict(loader, model, rank, world_size):
+def predict(loader, model, rank, world_size, device):
     model.eval()
     predictions = []
     with torch.no_grad():
         for X, y in loader:
-            X, y = X.to(rank % torch.cuda.device_count()), y.to(rank % torch.cuda.device_count())
+            X, y = X.to(device), y.to(device)
             output = model(X)
             predictions.append(output)
     return torch.cat(predictions) # output shape (# instances, # outputs)
 
-# train two models on two different views
-# then add top k% of predictions on the unlabeled set
+# add top k% of predictions on the unlabeled datasets
 # to the labeled datasets
 def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
             model0, model1, k,
-            rank, world_size):
-    pred_model0 = predict(loader_unlbl0, model0, rank, world_size)
-    pred_model1 = predict(loader_unlbl1, model1, rank, world_size)
+            rank, world_size, device):
+    pred_model0 = predict(loader_unlbl0, model0, rank, world_size, device)
+    pred_model1 = predict(loader_unlbl1, model1, rank, world_size, device)
 
     # get top-k predictions (labels, instance indexes in the dataset)
     _, lbl_topk0, idx_topk0 = get_topk_pred(
@@ -145,7 +144,7 @@ def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
     loader_unlbl0.dataset.samples = list_unlbl0
     loader_unlbl1.dataset.samples = list_unlbl1
 
-def train(args, rank, world_size, loader, model, optimizer, epoch,
+def train(args, rank, world_size, loader, model, optimizer, epoch, device,
           sampler=None):
     if sampler:
         sampler.set_epoch(epoch)
@@ -154,7 +153,7 @@ def train(args, rank, world_size, loader, model, optimizer, epoch,
     loss_fn = nn.CrossEntropyLoss()
     ddp_loss = torch.zeros(3).to(rank % torch.cuda.device_count())
     for batch, (X, y) in enumerate(loader):
-        X, y = X.to(rank % torch.cuda.device_count()), y.to(rank % torch.cuda.device_count())
+        X, y = X.to(device), y.to(device)
         optimizer.zero_grad()
         output = model(X)
         loss = loss_fn(output, y)
@@ -173,28 +172,28 @@ def train(args, rank, world_size, loader, model, optimizer, epoch,
                       ddp_loss[0] / ddp_loss[2]))
 
 
-def test(args, rank, world_size, loader, model):
+def test(args, rank, world_size, loader, model, device):
     model.eval()
     loss_fn = torch.nn.CrossEntropyLoss()
-    ddp_loss = torch.zeros(3).to(rank % torch.cuda.device_count())
-    for batch, (X, y) in enumerate(loader):
-        X, y = X.to(rank % torch.cuda.device_count()), y.to(rank % torch.cuda.device_count())
-        output = model(X)
-        loss = loss_fn(output, y)
-        ddp_loss[0] += loss.item()
-        ddp_loss[1] += (output.argmax(1) == y).type(torch.float).sum().item()
-        ddp_loss[2] += len(batch)
+    ddp_loss = torch.zeros(3).to(device)
+    with torch.no_grad():
+        for batch, (X, y) in enumerate(loader):
+            X, y = X.to(device), y.to(device)
+            output = model(X)
+            loss = loss_fn(output, y)
+            ddp_loss[0] += loss.item()
+            ddp_loss[1] += (output.argmax(1) == y).type(torch.float).sum().item()
+            ddp_loss[2] += len(batch)
     
     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
 
-    if rank == 0:
-        print('Test error: \tAccuracy: {:.2f}% \tAverage loss: {:.6f}'
-              .format(100*(ddp_loss[1] / ddp_loss[2]), 
-                      ddp_loss[0] / ddp_loss[2]))
-
     test_acc = ddp_loss[1] / ddp_loss[2] 
     test_loss = ddp_loss[0] / ddp_loss[2]
-    # return accuracy, loss
+
+    if rank == 0:
+        print('Test error: \tAccuracy: {:.2f}% \tAverage loss: {:.6f}'
+              .format(100*test_acc, test_loss))
+
     return test_acc, test_loss
 
 def training_process(args, rank, world_size):
@@ -231,8 +230,10 @@ def training_process(args, rank, world_size):
 
     data_unlbl0 = copy.deepcopy(data_train0)
     data_unlbl0.samples = samples_unlbl0
+
     data_val0 = copy.deepcopy(data_train0)
     data_val0.samples = samples_val0
+
     data_test0 = copy.deepcopy(data_train0)
     data_test0.samples = samples_test0
 
@@ -242,8 +243,10 @@ def training_process(args, rank, world_size):
     
     data_unlbl1 = copy.deepcopy(data_train1)
     data_unlbl1.samples = samples_unlbl1
+
     data_val1 = copy.deepcopy(data_train1)
     data_val1.samples = samples_val1
+
     data_test1 = copy.deepcopy(data_train1)
     data_test1.samples = samples_test1
 
@@ -251,7 +254,8 @@ def training_process(args, rank, world_size):
         size_based_auto_wrap_policy, min_num_params=10_000_000
     )
 
-    torch.cuda.set_device(rank % torch.cuda.device_count())
+    device = torch.device(rank % torch.cuda.device_count())
+    torch.cuda.set_device(device)
 
     if rank == 0:
         wandb.init(project='Co-Training', entity='ai2es',
@@ -261,9 +265,7 @@ def training_process(args, rank, world_size):
             })
 
     # instantiate models, send to device
-    model0, model1 = resnet50(), resnet50()
-    model0.to(rank % torch.cuda.device_count())
-    model1.to(rank % torch.cuda.device_count())
+    model0, model1 = resnet50().to(device), resnet50().to(device)
     
     # wrapping
     model0 = FSDP(model0, 
@@ -293,40 +295,54 @@ def training_process(args, rank, world_size):
     # instantiate samplers
     sampler_train0 = DistributedSampler(data_train0, rank=rank, num_replicas=world_size, shuffle=True)
     sampler_train1 = DistributedSampler(data_train1, rank=rank, num_replicas=world_size, shuffle=True)
+
     sampler_val0 = DistributedSampler(data_val0, rank=rank, num_replicas=world_size, shuffle=True)
     sampler_val1 = DistributedSampler(data_val1, rank=rank, num_replicas=world_size, shuffle=True)
+
     sampler_test0 = DistributedSampler(data_test0, rank=rank, num_replicas=world_size, shuffle=True)
     sampler_test1 = DistributedSampler(data_test1, rank=rank, num_replicas=world_size, shuffle=True)
+
     sampler_unlbl0 = DistributedSampler(data_unlbl0, rank=rank, num_replicas=world_size, shuffle=True)
     sampler_unlbl1 = DistributedSampler(data_unlbl1, rank=rank, num_replicas=world_size, shuffle=True)
 
     # dicts for unpacking
-    train0_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_train0,
-                     'num_workers': 12, 'pin_memory': True, 'shuffle': False}
-    train1_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_train1,
-                     'num_workers': 12, 'pin_memory': True, 'shuffle': False}
-    val0_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_val0,
-                     'num_workers': 12, 'pin_memory': True, 'shuffle': False}
-    val1_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_val1,
-                     'num_workers': 12, 'pin_memory': True, 'shuffle': False}
-    test0_kwargs = {'batch_size': args.test_batch_size, 'sampler': sampler_test0,
-                     'num_workers': 12, 'pin_memory': True, 'shuffle': False}
-    test1_kwargs = {'batch_size': args.test_batch_size, 'sampler': sampler_test1,
-                     'num_workers': 12, 'pin_memory': True, 'shuffle': False}
-    unlbl0_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_unlbl0,
-                     'num_workers': 12, 'pin_memory': True, 'shuffle': False}
-    unlbl1_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_unlbl1,
-                     'num_workers': 12, 'pin_memory': True, 'shuffle': False}
-    
+    train0_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_train0}
+    train1_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_train1}
+
+    val0_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_val0}
+    val1_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_val1}
+
+    test0_kwargs = {'batch_size': args.test_batch_size, 'sampler': sampler_test0}
+    test1_kwargs = {'batch_size': args.test_batch_size, 'sampler': sampler_test1}
+
+    unlbl0_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_unlbl0}
+    unlbl1_kwargs = {'batch_size': args.batch_size, 'sampler': sampler_unlbl1}
+
+    cuda_kwargs = {'num_workers': 12, 'pin_memory': True, 'shuffle': False}
+
+    train0_kwargs.update(cuda_kwargs)
+    train1_kwargs.update(cuda_kwargs)
+
+    val0_kwargs.update(cuda_kwargs)
+    val1_kwargs.update(cuda_kwargs)
+
+    test0_kwargs.update(cuda_kwargs)
+    test1_kwargs.update(cuda_kwargs)
+
+    unlbl0_kwargs.update(cuda_kwargs)
+    unlbl1_kwargs.update(cuda_kwargs)
+
     # dataloader time
     loader_train0 = DataLoader(data_train0, **train0_kwargs)
-    loader_val0 = DataLoader(data_val0, **val0_kwargs)
-    loader_test0 = DataLoader(data_test0, **test0_kwargs)
-    loader_unlbl0 = DataLoader(data_unlbl0, **unlbl0_kwargs)
-    
     loader_train1 = DataLoader(data_train1, **train1_kwargs)
+    
+    loader_val0 = DataLoader(data_val0, **val0_kwargs)
     loader_val1 = DataLoader(data_val1, **val1_kwargs)
+
+    loader_test0 = DataLoader(data_test0, **test0_kwargs)
     loader_test1 = DataLoader(data_test1, **test1_kwargs)
+    
+    loader_unlbl0 = DataLoader(data_unlbl0, **unlbl0_kwargs)
     loader_unlbl1 = DataLoader(data_unlbl1, **unlbl1_kwargs)
 
     states = {
@@ -336,26 +352,83 @@ def training_process(args, rank, world_size):
         'optimizer1_state': optimizer1.state_dict()}
 
 
-    k = len(loader_unlbl0.dataset)
-    for i in range(1, args.cotrain_iters + 1):
+    k = len(loader_unlbl0.dataset * args.k)
+    best_vloss0, best_vloss1 = 0.0, 0.0
+    epochs_since_improvement0 = 0
+    epochs_since_improvement1 = 0
+    for c_iter in range(1, args.cotrain_iters + 1):
+        # if there's no more unlabeled examples for co-training, stop the process
         if len(loader_unlbl0.dataset) == 0 and len(loader_unlbl1.dataset) == 0: 
             break
-
-        for epoch in range(1, args.epochs + 1):
-            train(args, rank, world_size, loader_train0, model0, optimizer0, epoch, sampler_train0)
-            val_acc0, val_loss0 = test(args, rank, world_size, loader_val0, model0)
-            scheduler0.step(val_loss0)
-        # TODO add some logging things somewhere here. also early stopping/getting best model state
-        for epoch in range(1, args.epochs + 1):
-            train(args, rank, world_size, loader_train1, model1, optimizer1)
-            val_acc1, val_loss1 = test(args, rank, world_size, loader_val1, model1)
-            scheduler1.step(val_loss1)
         
-        cotrain(loader_train0, loader_train1, loader_unlbl0, loader_unlbl1, model0, model1, k,
-                rank, world_size)
-        
+        for epoch in range(1, args.epochs + 1):
+            train(args, rank, world_size, loader_train0, model0, optimizer0, epoch, device, sampler_train0)
+            val_acc0, vloss0 = test(args, rank, world_size, loader_val0, model0)
 
-    # TODO return dict of states, metrics
+            epochs_since_improvement0 += 1
+            if vloss0 > best_vloss0:
+                best_vloss0 = vloss0
+                epochs_since_improvement0 = 0
+                states['model0_state'] = model0.state_dict()
+                states['optimizer0_state'] = optimizer0.state_dict()
+            
+            if rank == 0:
+                wandb.log({'val_acc0': val_acc0,
+                          'vloss0': vloss0,
+                          'best_vloss0': best_vloss0},
+                          step=epoch)
+                
+            if epochs_since_improvement0 > args.patience: 
+                break
+
+            scheduler0.step(vloss0)
+        
+        for epoch in range(1, args.epochs + 1):
+            train(args, rank, world_size, loader_train1, model1, device, optimizer1)
+            val_acc1, vloss1 = test(args, rank, world_size, loader_val1, model1)
+
+            epochs_since_improvement1 += 1
+            if vloss1 > best_vloss1:
+                best_vloss1 = vloss1
+                epochs_since_improvement1 = 0
+                states['model1_state'] = model1.state_dict()
+                states['optimizer1_state'] = optimizer1.state_dict()
+            
+            if rank == 0:
+                wandb.log({'val_acc1': val_acc1,
+                          'vloss1': vloss1,
+                          'best_vloss1': best_vloss1},
+                          step=epoch)
+                
+            if epochs_since_improvement1 > args.patience: 
+                break
+
+            scheduler1.step(vloss1)
+        
+        cotrain(loader_train0, loader_train1, 
+                loader_unlbl0, loader_unlbl1, 
+                model0, model1, k,
+                rank, world_size, device)
+
+        # test here, probably
+        test_acc0, test_loss0 = test(args, rank, world_size, loader_test0, model0, device)
+        test_acc1, test_loss1 = test(args, rank, world_size, loader_test1, model1, device)
+
+        if rank == 0:
+            wandb.log({'test_acc0': test_acc0,
+                       'test_loss0': test_loss0,
+                       'test_acc1' : test_acc1,
+                       'test_loss1': test_loss1},
+                       step=c_iter)
+
+    if rank == 0:
+        wandb.finish()
+
+    # barrier or something
+    dist.barrier()
+
+    # TODO return dict of states, metrics (<-- (what is this...?)
+    return states, None
 
 def setup(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -367,7 +440,7 @@ def main(args, rank, world_size):
 
     setup(rank, world_size)
 
-    states, metric = training_process(args, rank, world_size)
+    states, metrics = training_process(args, rank, world_size)
 
     if rank == 0:
         torch.save(states, '/home/scratch/tiffanyle/cotraining/states.pth')
@@ -391,7 +464,7 @@ def create_parser():
                         help='number of epochs to train for without improvement (default: 10)')
     parser.add_argument('--cotrain_iters', type=int, default=25,
                         help='max number of iterations for co-training (default: 25)')
-    parser.add_argument('-k', type=float, default=0.05,
+    parser.add_argument('--k', type=float, default=0.05,
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.05)')
     #blah add more here
@@ -402,5 +475,8 @@ if __name__ == '__main__':
     parser = create_parser()
     args = parser.parse_args()
     
-    main(args)
+    world_size = int(os.environ["WORLD_SIZE"])
+    rank = os.environ("RANK")
+
+    main(args, rank, world_size)
     
