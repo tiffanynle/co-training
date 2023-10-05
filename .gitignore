@@ -1,2 +1,2 @@
-Dataset/
+torchrun.sh
 cotraining_samples_lists.pkl
