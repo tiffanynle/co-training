@@ -1,2 +1,9 @@
-torchrun.sh
-cotraining_samples_lists.pkl
+# Various files
+torchrun.sbatch
+cotraining_samples_lists*.pkl
+
+# Weights and Biases and other things
+wandb/
+
+# Python
+__pycache__/
