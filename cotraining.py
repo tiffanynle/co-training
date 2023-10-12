@@ -36,6 +36,9 @@ def get_topk_pred(pred, k):
     idx = torch.argsort(prob, descending=True)[:k]
     return prob[idx].cpu(), label[idx].cpu(), idx.cpu()
 
+# TODO need to revise this
+# once data starts getting removed from the unlabeled sets
+# it is likely that the two views aren't aligned anymore (...)
 def remove_collisions(lbl_model0, lbl_model1, idx_model0, idx_model1):
     # find instances and indices of instances that have
     # been labeled as most confident by both model0, model1
@@ -65,24 +68,30 @@ def remove_collisions(lbl_model0, lbl_model1, idx_model0, idx_model1):
         # masks to remove the instances with conflicting predictions
         mask0 = np.ones(len(idx_model0), dtype=bool)
         mask0[idx_coll0] = False
+
         mask1 = np.ones(len(idx_model1), dtype=bool)
         mask1[idx_coll1] = False
 
         lbl_model0 = lbl_model0[mask0]
-        lbl_model1 = lbl_model1[mask1]
         idx_model0 = idx_model0[mask0]
+
+        lbl_model1 = lbl_model1[mask1]
         idx_model1 = idx_model1[mask1]
 
     return lbl_model0, lbl_model1, idx_model0, idx_model1
 
-def predict(loader, model, rank, world_size, device):
+def predict(loader, model, num_classes, rank, world_size, device):
     model.eval()
     predictions = []
     with torch.no_grad():
         for X, y in loader:
-            X, y = X.to(device), y.to(device)
-            output = model(X)
-            predictions.append(output)
+            tensor_list = [torch.zeros((X.shape[0], num_classes), dtype=torch.float16)
+                           .to(device) 
+                           for _ in range(world_size)]
+            dist.all_gather(tensor_list, model(X.to(device)))
+            batch_outputs = torch.cat(tensor_list)
+            predictions.append(batch_outputs)
+    
     return torch.cat(predictions) # output shape (# instances, # outputs)
 
 # add top k% of predictions on the unlabeled datasets
@@ -90,8 +99,9 @@ def predict(loader, model, rank, world_size, device):
 def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
             model0, model1, k,
             rank, world_size, device):
-    pred_model0 = predict(loader_unlbl0, model0, rank, world_size, device)
-    pred_model1 = predict(loader_unlbl1, model1, rank, world_size, device)
+    num_classes = len(loader0.dataset.classes)
+    pred_model0 = predict(loader_unlbl0, model0, num_classes, rank, world_size, device)
+    pred_model1 = predict(loader_unlbl1, model1, num_classes, rank, world_size, device)
 
     # get top-k predictions (labels, instance indexes in the dataset)
     _, lbl_topk0, idx_topk0 = get_topk_pred(
@@ -113,7 +123,7 @@ def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
     lbl_topk0, lbl_topk1, idx_topk0, idx_topk1 = \
     remove_collisions(lbl_topk0, lbl_topk1, idx_topk0, idx_topk1)
 
-    # convert from list to array for the convenient numpy indexing 
+    # convert from list to array for the convenient numpy indexing
     samples_unlbl0 = np.stack([np.array(a) for a in loader_unlbl0.dataset.samples])
     samples_unlbl1 = np.stack([np.array(a) for a in loader_unlbl1.dataset.samples])
 
@@ -124,8 +134,8 @@ def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
     paths1 = [i for i, _ in list_samples1]
 
     # add pseudolabeled instances to the labeled datasets
-    loader0.dataset.samples = add_to_imagefolder(paths1, list(lbl_topk1), loader0.dataset)
-    loader1.dataset.samples = add_to_imagefolder(paths0, list(lbl_topk0), loader1.dataset)
+    loader0.dataset.samples = add_to_imagefolder(paths1, lbl_topk1.tolist(), loader0.dataset)
+    loader1.dataset.samples = add_to_imagefolder(paths0, lbl_topk0.tolist(), loader1.dataset)
 
     # remove instances from unlabeled dataset
     mask_unlbl0 = np.ones(len(loader_unlbl0.dataset), dtype=bool)
@@ -145,6 +155,10 @@ def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
     loader_unlbl0.dataset.samples = list_unlbl0
     loader_unlbl1.dataset.samples = list_unlbl1
 
+    print("Size of unlbl0: {}\t unlbl1: {}\t lbl0: {}\t lbl1: {}\t"
+        .format(len(loader_unlbl0.dataset), len(loader_unlbl1.dataset),
+                len(loader0.dataset), len(loader1.dataset)))
+
 def train(args, rank, world_size, loader, model, optimizer, epoch, device,
           sampler=None):
     if sampler:
@@ -152,7 +166,7 @@ def train(args, rank, world_size, loader, model, optimizer, epoch, device,
 
     model.train()
     loss_fn = nn.CrossEntropyLoss()
-    ddp_loss = torch.zeros(3).to(rank % torch.cuda.device_count())
+    ddp_loss = torch.zeros(3).to(device)
     for batch, (X, y) in enumerate(loader):
         X, y = X.to(device), y.to(device)
         optimizer.zero_grad()
@@ -171,7 +185,6 @@ def train(args, rank, world_size, loader, model, optimizer, epoch, device,
               .format(epoch, 
                       100*(ddp_loss[1] / ddp_loss[2]), 
                       ddp_loss[0] / ddp_loss[2]))
-
 
 def test(args, rank, world_size, loader, model, device):
     model.eval()
@@ -237,10 +250,10 @@ def training_process(args, rank, world_size):
     samples_train0, samples_train1, samples_val0, samples_val1 = \
         train_test_split_samples(samples_train0, samples_train1,
                                  test_size=0.125, random_state=13)
-
-    print("Length of datasets -- Train: {} \tUnlabeled: {} \tVal: {} \tTest: {}"
-          .format(len(samples_train0), len(samples_unlbl0),
-                  len(samples_val0), len(samples_test0)))
+    if rank == 0:
+        print("Length of datasets:\n Train: {} \tUnlabeled: {} \tVal: {} \tTest: {}"
+            .format(len(samples_train0), len(samples_unlbl0),
+                    len(samples_val0), len(samples_test0)))
 
     # ResNet50 wants 224x224 images
     trans = transforms.Compose([
@@ -272,8 +285,9 @@ def training_process(args, rank, world_size):
     device = torch.device(rank % torch.cuda.device_count())
     torch.cuda.set_device(device)
 
-    # instantiate models, send to device
-    model0, model1 = resnet50().to(device), resnet50().to(device)
+    # instantiate models, send to device 
+    # (make sure to set the number of classes to predict... default is 1000)
+    model0, model1 = resnet50(num_classes=3).to(device), resnet50(num_classes=3).to(device)
     
     # wrapping to take advantage of FSDP
     model0 = FSDP(model0, 
@@ -302,7 +316,6 @@ def training_process(args, rank, world_size):
 
     cuda_kwargs = {'num_workers': 12, 'pin_memory': True, 'shuffle': False}
 
-
     states = {
         'model0_state': model0.state_dict(), 
         'optimizer0_state': optimizer0.state_dict(),
@@ -319,7 +332,7 @@ def training_process(args, rank, world_size):
             wandb.init(project='Co-Training', entity='ai2es',
             name=f"{rank}: Co-Training",
             config={'args': vars(args)})
-            print(f"Co-Training Iteration: {c_iter}")
+            print(f"Co-Training Iteration: {c_iter}\n---------------------------------------")
 
         # Instantiate samplers and get DataLoader objects
         sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
@@ -330,7 +343,7 @@ def training_process(args, rank, world_size):
         sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
         sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs)
         sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
-        sample_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
+        sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
 
         # if there's no more unlabeled examples for co-training, stop the process
         if len(loader_unlbl0.dataset) == 0 and len(loader_unlbl1.dataset) == 0: 
@@ -402,7 +415,7 @@ def training_process(args, rank, world_size):
     # barrier or something
     dist.barrier()
 
-    # TODO return dict of states, metrics (<-- (what is this...?)
+    # TODO return dict of states, metrics <-- (what is this...?)
     return states, None
 
 def setup(rank, world_size):
