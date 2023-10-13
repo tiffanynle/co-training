@@ -31,123 +31,129 @@ from utils import add_to_imagefolder, train_test_split_samples
 
 # takes in a Tensor of shape e.g. (# instances, # prob outputs) and returns a tuple
 # (Tensor[top probabilities], Tensor[predicted labels], Tensor[instance indexes])
-def get_topk_pred(pred, k):
+def get_topk_predictions(pred, k):
     prob, label = torch.max(pred, 1)
     idx = torch.argsort(prob, descending=True)[:k]
-    return prob[idx].cpu(), label[idx].cpu(), idx.cpu()
+    return prob[idx], label[idx], idx
 
-# TODO need to revise this
-# once data starts getting removed from the unlabeled sets
-# it is likely that the two views aren't aligned anymore (...)
-def remove_collisions(lbl_model0, lbl_model1, idx_model0, idx_model1):
-    # find instances and indices of instances that have
-    # been labeled as most confident by both model0, model1
+# TODO extract some of the logic into another function (so messy...)
+def remove_collisions(lbl_model0, idx_model0, lbl_model1, idx_model1):
+    # convert tensors to np arrays, as mixing use of tensors
+    # and arrays together can cause some strange behaviors
+    # (they will still both point to the same place in memory)
+    lbl_model0_np = lbl_model0.cpu().detach().numpy()
+    lbl_model1_np = lbl_model1.cpu().detach().numpy()
+    idx_model0_np = idx_model0.cpu().detach().numpy()
+    idx_model1_np = idx_model1.cpu().detach().numpy()
+    
+    # find which instances have been labeled with 
+    # the most confidence by both model0 and model1
     inter, idx_inter0, idx_inter1 = np.intersect1d(
-                                        idx_model0,
-                                        idx_model1,
+                                        idx_model0_np,
+                                        idx_model1_np,
                                         return_indices=True)
 
-    print(f"Number of predictions (model0): {len(idx_model0)}")
-    print(f"Number of predictions (model1): {len(idx_model1)}")
-    print(f"Found {len(inter)} potential conflicting predictions")
+    print('Intersection: {} \nidx_inter0: {} \nidx_inter1: {}'
+          .format(inter, idx_inter0, idx_inter1))
 
-    # bool mask to identify the conflicting predictions (collision)
-    mask_coll = lbl_model0[idx_inter0] != lbl_model1[idx_inter1]
-    collisions = inter[mask_coll]
+    # which instances have a conflicting prediction from both models?
+    mask_coll = lbl_model0_np[idx_inter0] != lbl_model1_np[idx_inter1]
+    idx_colls = inter[mask_coll]
 
-    print(f"Found {len(collisions)} conflicting predictions")
+    print(f"mask_coll: {mask_coll}")
 
-    if (len(collisions) > 0):
-        print(f"Collisions: {collisions}")
-        # find where these collisions are actually at
-        # in their respective lists, and remove them...
-        # (maybe want to return this as well? ...)
+    # TODO may also want to return the predicted labels for the collisions
+    if (len(idx_colls) > 0):
+        print(f"idx_cols: {idx_colls}")
         idx_coll0 = idx_inter0[mask_coll]
         idx_coll1 = idx_inter1[mask_coll]
+        
+        mask = np.ones(len(idx_model0), dtype=bool)
+        mask[idx_coll0] = False
+        mask[idx_coll1] = False
 
-        # masks to remove the instances with conflicting predictions
-        mask0 = np.ones(len(idx_model0), dtype=bool)
-        mask0[idx_coll0] = False
+        lbl_model0_np = lbl_model0_np[mask]
+        idx_model0_np = idx_model0_np[mask]
 
-        mask1 = np.ones(len(idx_model1), dtype=bool)
-        mask1[idx_coll1] = False
+        lbl_model1_np = lbl_model1_np[mask]
+        idx_model1_np = idx_model1_np[mask]
 
-        lbl_model0 = lbl_model0[mask0]
-        idx_model0 = idx_model0[mask0]
-
-        lbl_model1 = lbl_model1[mask1]
-        idx_model1 = idx_model1[mask1]
-
-    return lbl_model0, lbl_model1, idx_model0, idx_model1
+    return lbl_model0_np, idx_model0_np, lbl_model1_np, idx_model1_np, idx_colls
 
 def predict(loader, model, num_classes, rank, world_size, device):
     model.eval()
     predictions = []
     with torch.no_grad():
         for X, y in loader:
-            tensor_list = [torch.zeros((X.shape[0], num_classes), dtype=torch.float16)
-                           .to(device) 
+            tensor_list = [torch.zeros((X.shape[0], num_classes), 
+                                       dtype=torch.float16)
+                                       .to(device) 
                            for _ in range(world_size)]
             dist.all_gather(tensor_list, model(X.to(device)))
             batch_outputs = torch.cat(tensor_list)
             predictions.append(batch_outputs)
-    
-    return torch.cat(predictions) # output shape (# instances, # outputs)
+    return torch.cat(predictions)
 
 # add top k% of predictions on the unlabeled datasets
 # to the labeled datasets
 def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
-            model0, model1, k,
-            rank, world_size, device):
+            model0, model1, k, rank, world_size, device):
     num_classes = len(loader0.dataset.classes)
     pred_model0 = predict(loader_unlbl0, model0, num_classes, rank, world_size, device)
     pred_model1 = predict(loader_unlbl1, model1, num_classes, rank, world_size, device)
 
-    # get top-k predictions (labels, instance indexes in the dataset)
-    _, lbl_topk0, idx_topk0 = get_topk_pred(
-                                    pred_model0,
-                                    k if k <= len(pred_model0) 
-                                    else len(pred_model0))
+    print(f"shape pred_model0 {pred_model0.shape}\t pred_model1 {pred_model1.shape}")
 
-    _, lbl_topk1, idx_topk1 = get_topk_pred(
+    _, lbl_topk0, idx_topk0 = get_topk_predictions(
+                                    pred_model0,
+                                    k if k <= len(pred_model0) else len(pred_model0))
+    _, lbl_topk1, idx_topk1 = get_topk_predictions(
                                     pred_model1, 
-                                    k if k <= len(pred_model1) 
-                                    else len(pred_model1))
+                                    k if k <= len(pred_model1) else len(pred_model1))
 
     print(f"Number of unlabeled instances: {len(loader_unlbl0.dataset)}")
 
-    # what if two models predict confidently on the same instance?
+    # if two models predict confidently on the same instance,
     # find and remove conflicting predictions from the lists
-    # TODO also return the indices of the conflicting predictions
-    # and print out the imagepaths, maybe?
-    lbl_topk0, lbl_topk1, idx_topk0, idx_topk1 = \
-    remove_collisions(lbl_topk0, lbl_topk1, idx_topk0, idx_topk1)
+    lbl_topk0, idx_topk0, lbl_topk1, idx_topk1, idx_colls = \
+    remove_collisions(lbl_topk0, idx_topk0, lbl_topk1, idx_topk1)
 
-    # convert from list to array for the convenient numpy indexing
     samples_unlbl0 = np.stack([np.array(a) for a in loader_unlbl0.dataset.samples])
     samples_unlbl1 = np.stack([np.array(a) for a in loader_unlbl1.dataset.samples])
 
-    list_samples0 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl0[idx_topk0])]
-    list_samples1 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl1[idx_topk1])] 
+    print("shape samples_unlbl0: {}\t samples_unlbl1: {}\t idx_topk0: {}\t idx_topk1: {}"
+          .format(samples_unlbl0.shape, samples_unlbl1.shape,
+                  idx_topk0.shape, idx_topk1.shape))
 
+    print("idx_topk0: {}\nidx_topk1: {}"
+          .format(idx_topk0, idx_topk1))
+
+    if len(idx_colls) > 0:
+        print("\nImage paths of collisions:\n unlbl0:\n {}\n unlbl1:\n {}\n"
+             .format(samples_unlbl0[idx_colls],
+                     samples_unlbl1[idx_colls]))
+
+    # retrieve the instances that have been labeled with high confidence by the other model
+    list_samples0 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl0[idx_topk1])]
+    list_samples1 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl1[idx_topk0])]
+
+    # image paths for both
     paths0 = [i for i, _ in list_samples0]
     paths1 = [i for i, _ in list_samples1]
 
     # add pseudolabeled instances to the labeled datasets
-    loader0.dataset.samples = add_to_imagefolder(paths1, lbl_topk1.tolist(), loader0.dataset)
-    loader1.dataset.samples = add_to_imagefolder(paths0, lbl_topk0.tolist(), loader1.dataset)
+    loader0.dataset.samples = add_to_imagefolder(paths0, lbl_topk1.tolist(), loader0.dataset)
+    loader1.dataset.samples = add_to_imagefolder(paths1, lbl_topk0.tolist(), loader1.dataset)
 
     # remove instances from unlabeled dataset
-    mask_unlbl0 = np.ones(len(loader_unlbl0.dataset), dtype=bool)
-    mask_unlbl1 = np.ones(len(loader_unlbl1.dataset), dtype=bool)
+    mask = np.ones(len(loader_unlbl0.dataset), dtype=bool)
+    mask[idx_topk0] = False
+    mask[idx_topk1] = False
 
-    mask_unlbl0[idx_topk0] = False
-    mask_unlbl1[idx_topk1] = False
+    print(f"Number of unlabeled instances to remove: {(~mask).sum()}")
 
-    print(f"Number of unlabeled instances to remove: {(~mask_unlbl0).sum()}")
-
-    samples_unlbl0 = samples_unlbl0[mask_unlbl0]
-    samples_unlbl1 = samples_unlbl1[mask_unlbl1]
+    samples_unlbl0 = samples_unlbl0[mask]
+    samples_unlbl1 = samples_unlbl1[mask]
 
     list_unlbl0 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl0)]
     list_unlbl1 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl1)]
@@ -155,29 +161,33 @@ def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
     loader_unlbl0.dataset.samples = list_unlbl0
     loader_unlbl1.dataset.samples = list_unlbl1
 
-    print("Size of unlbl0: {}\t unlbl1: {}\t lbl0: {}\t lbl1: {}\t"
-        .format(len(loader_unlbl0.dataset), len(loader_unlbl1.dataset),
-                len(loader0.dataset), len(loader1.dataset)))
+    print(f"Remaining number of unlabeled instances: {len(loader_unlbl0.dataset)}")
 
 def train(args, rank, world_size, loader, model, optimizer, epoch, device,
           sampler=None):
     if sampler:
         sampler.set_epoch(epoch)
 
-    model.train()
     loss_fn = nn.CrossEntropyLoss()
     ddp_loss = torch.zeros(3).to(device)
+    model.train()
     for batch, (X, y) in enumerate(loader):
         X, y = X.to(device), y.to(device)
         optimizer.zero_grad()
+
+        # Compute prediction error
         output = model(X)
         loss = loss_fn(output, y)
+
+        # Backpropagation
         loss.backward()
         optimizer.step()
+
+        # Calculate accuracy, loss (locally)
         ddp_loss[0] += loss.item()
         ddp_loss[1] += (output.argmax(1) == y).type(torch.float).sum().item()
         ddp_loss[2] += len(X)
-    
+
     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
 
     if rank == 0:
@@ -187,9 +197,9 @@ def train(args, rank, world_size, loader, model, optimizer, epoch, device,
                       ddp_loss[0] / ddp_loss[2]))
 
 def test(args, rank, world_size, loader, model, device):
-    model.eval()
     loss_fn = torch.nn.CrossEntropyLoss()
     ddp_loss = torch.zeros(3).to(device)
+    model.eval()
     with torch.no_grad():
         for batch, (X, y) in enumerate(loader):
             X, y = X.to(device), y.to(device)
@@ -237,17 +247,17 @@ def training_process(args, rank, world_size):
     with open('cotraining_samples_lists_fixed.pkl', 'rb') as fp:
         data = pickle.load(fp)
 
-    # split samples into labeled, unlabeled (25/75 split)
-    samples_train0, samples_train1, samples_unlbl0, samples_unlbl1 = \
-    train_test_split_samples(data['labeled'], data['inferred'],
-                             test_size=0.75, random_state=13)
-    
+    # split data into labeled/unlabeled (25/75 split)
+    samples_train0, samples_unlbl0, samples_train1, samples_unlbl1 = \
+        train_test_split_samples(data['labeled'], data['inferred'],
+                                test_size=0.75, random_state=13)
+        
     # split the data so we get 70/10/20 train/val/test
-    samples_train0, samples_train1, samples_test0, samples_test1 = \
+    samples_train0, samples_test0, samples_train1, samples_test1 = \
         train_test_split_samples(samples_train0, samples_train1,
                                  test_size=0.2, random_state=13)
 
-    samples_train0, samples_train1, samples_val0, samples_val1 = \
+    samples_train0, samples_val0, samples_train1, samples_val1 = \
         train_test_split_samples(samples_train0, samples_train1,
                                  test_size=0.125, random_state=13)
     if rank == 0:
@@ -286,7 +296,6 @@ def training_process(args, rank, world_size):
     torch.cuda.set_device(device)
 
     # instantiate models, send to device 
-    # (make sure to set the number of classes to predict... default is 1000)
     model0, model1 = resnet50(num_classes=3).to(device), resnet50(num_classes=3).to(device)
     
     # wrapping to take advantage of FSDP
@@ -322,32 +331,31 @@ def training_process(args, rank, world_size):
         'model1_state': model1.state_dict(),
         'optimizer1_state': optimizer1.state_dict()}
 
+    # Instantiate samplers and get DataLoader objects
+    sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
+    sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs)
+    sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, cuda_kwargs)
+    sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, cuda_kwargs)
+
+    sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
+    sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs)
+    sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
+    sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
 
     k = floor(len(data_unlbl0) * args.k)
     best_vloss0, best_vloss1 = float("inf"), float("inf")
     epochs_since_improvement0 = 0
     epochs_since_improvement1 = 0
     for c_iter in range(1, args.cotrain_iters + 1):
+        # if there's no more unlabeled examples for co-training, stop the process
+        if len(loader_unlbl0.dataset) == 0 and len(loader_unlbl1.dataset) == 0: 
+            break
+
         if rank == 0:
             wandb.init(project='Co-Training', entity='ai2es',
             name=f"{rank}: Co-Training",
             config={'args': vars(args)})
             print(f"Co-Training Iteration: {c_iter}\n---------------------------------------")
-
-        # Instantiate samplers and get DataLoader objects
-        sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
-        sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs)
-        sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, cuda_kwargs)
-        sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, cuda_kwargs)
-
-        sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
-        sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs)
-        sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
-        sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
-
-        # if there's no more unlabeled examples for co-training, stop the process
-        if len(loader_unlbl0.dataset) == 0 and len(loader_unlbl1.dataset) == 0: 
-            break
         
         for epoch in range(1, args.epochs + 1):
             train(args, rank, world_size, loader_train0, model0, optimizer0, epoch, device, sampler_train0)
@@ -386,7 +394,7 @@ def training_process(args, rank, world_size):
                 wandb.log({'val_acc1': val_acc1,
                           'vloss1': vloss1,
                           'best_vloss1': best_vloss1},
-                          step=epoch + args.epochs + 1)
+                          step=epoch + args.epochs)
                 
             if epochs_since_improvement1 > args.patience: 
                 break
@@ -398,7 +406,6 @@ def training_process(args, rank, world_size):
                 model0, model1, k,
                 rank, world_size, device)
 
-        # test here, probably
         test_acc0, test_loss0 = test(args, rank, world_size, loader_test0, model0, device)
         test_acc1, test_loss1 = test(args, rank, world_size, loader_test1, model1, device)
 
@@ -412,10 +419,20 @@ def training_process(args, rank, world_size):
         if rank == 0:
             wandb.finish()
 
-    # barrier or something
+        # Re-instantiate samplers and DataLoader objects
+        sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
+        sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs)
+        sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, cuda_kwargs)
+        sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, cuda_kwargs)
+
+        sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
+        sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs)
+        sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
+        sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
+
     dist.barrier()
 
-    # TODO return dict of states, metrics <-- (what is this...?)
+    # TODO return states, best metric
     return states, None
 
 def setup(rank, world_size):
@@ -455,7 +472,7 @@ def create_parser():
     parser.add_argument('--k', type=float, default=0.05,
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.05)')
-    #blah add more here
+    # TODO add additional arguments
     
     return parser
 
