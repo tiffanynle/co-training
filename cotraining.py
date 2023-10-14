@@ -83,22 +83,21 @@ def remove_collisions(lbl_model0, idx_model0, lbl_model1, idx_model1):
 def predict(rank, world_size, batch_size, loader, model, num_classes, device):
     model.eval()
     predictions = []
+    softmax = torch.nn.Softmax(-1)
     with torch.no_grad():
         for X, y in loader:
             # when all-gathering, it may be the case 
             # some ranks have tensors that are smaller than
             # the tensor they are being gathered into (...?)
-            tensor_list = [torch.zeros((batch_size, num_classes),
+            tensor_list = [torch.full((batch_size, num_classes), -1,
                                       dtype=torch.float16).to(device) 
                            for _ in range(world_size)]
-            output = model(X.to(device))
+            output = softmax(model(X.to(device)))
+            pad = torch.full((batch_size, num_classes), -1, dtype=torch.float16).to(device)
+            pad[:output.shape[0]] = output
             # pad the output so that it contains the same 
             # number of rows as specified by the batch size
-            diff = batch_size - output.shape[0]
-            pad = torch.full((diff, num_classes), -1,
-                                 dtype=torch.float16).to(device)
-            output = torch.cat((output, pad))
-            dist.all_gather(tensor_list, output)
+            dist.all_gather(tensor_list, pad)
             batch_outputs = torch.cat(tensor_list)
             # remove all rows of the tensor that contain a -1
             # (as this is not a valid value anywhere)
@@ -113,10 +112,17 @@ def cotrain(args, rank, world_size,
             loader0, loader1, loader_unlbl0, loader_unlbl1,
             model0, model1, k, device):
     num_classes = len(loader0.dataset.classes)
+    
     pred_model0 = predict(rank, world_size, args.batch_size,
-                          loader_unlbl0, model0, num_classes, device)
+                          loader_unlbl0, model0, num_classes, device)[:len(loader_unlbl0.dataset)]
+
     pred_model1 = predict(rank, world_size, args.batch_size,
-                          loader_unlbl1, model1, num_classes, device)
+                          loader_unlbl1, model1, num_classes, device)[:len(loader_unlbl0.dataset)]
+
+    # this may be superfluous, but I want to make sure we agree.
+    dist.broadcast(pred_model0, 0)
+    dist.broadcast(pred_model1, 0)
+
     print(f"Number of unlabeled instances view0 {len(loader_unlbl0.dataset)} view1 {len(loader_unlbl1.dataset)}")
     print(f"shape pred_model0 {pred_model0.shape}\t pred_model1 {pred_model1.shape}")
 
@@ -139,9 +145,6 @@ def cotrain(args, rank, world_size,
     print("shape samples_unlbl0: {}\t samples_unlbl1: {}\t idx_topk0: {}\t idx_topk1: {}"
           .format(samples_unlbl0.shape, samples_unlbl1.shape,
                   idx_topk0.shape, idx_topk1.shape))
-
-    print("idx_topk0: {}\nidx_topk1: {}"
-          .format(idx_topk0, idx_topk1))
 
     if len(idx_colls) > 0:
         print("\nImage paths of collisions:\n unlbl0:\n {}\n unlbl1:\n {}\n"
@@ -246,8 +249,8 @@ def create_imagefolder(data, samples, path, transform, new_path=None):
 
     return imgfolder
 
-def create_sampler_loader(args, rank, world_size, data, cuda_kwargs):
-    sampler = DistributedSampler(data, rank=rank, num_replicas=world_size, shuffle=True)
+def create_sampler_loader(args, rank, world_size, data, cuda_kwargs, shuffle=True):
+    sampler = DistributedSampler(data, rank=rank, num_replicas=world_size, shuffle=shuffle)
 
     loader_kwargs = {'batch_size': args.batch_size, 'sampler': sampler}
     loader_kwargs.update(cuda_kwargs)
@@ -304,7 +307,7 @@ def training_process(args, rank, world_size):
     data_test1 = create_imagefolder(data, samples_test1, dummy_path, trans, new_path)
 
     auto_wrap_policy = functools.partial(
-        size_based_auto_wrap_policy, min_num_params=10_000_000
+        size_based_auto_wrap_policy, min_num_params=1_000_000
     )
 
     device = torch.device(rank % torch.cuda.device_count())
@@ -348,27 +351,28 @@ def training_process(args, rank, world_size):
 
     # Instantiate samplers and get DataLoader objects
     sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
-    sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs)
+    sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs, shuffle=False)
     sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, cuda_kwargs)
     sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, cuda_kwargs)
 
     sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
-    sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs)
+    sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs, shuffle=False)
     sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
     sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
 
-    k = floor(len(data_unlbl0) * args.k)
-    best_vloss0, best_vloss1 = float("inf"), float("inf")
-    epochs_since_improvement0 = 0
-    epochs_since_improvement1 = 0
     for c_iter in range(1, args.cotrain_iters + 1):
+        k = floor(len(data_unlbl0) * args.k)
+        best_vloss0, best_vloss1 = float("inf"), float("inf")
+        best_val_acc0, best_val_acc1 = 0, 0
+        epochs_since_improvement0 = 0
+        epochs_since_improvement1 = 0
         # if there's no more unlabeled examples for co-training, stop the process
         if len(loader_unlbl0.dataset) == 0 and len(loader_unlbl1.dataset) == 0: 
             break
 
         if rank == 0:
             wandb.init(project='Co-Training', entity='ai2es',
-            name=f"{rank}: Co-Training",
+            name=f"{rank}: Co-Training - {c_iter}",
             config={'args': vars(args)})
             print(f"Co-Training Iteration: {c_iter}\n---------------------------------------")
         
@@ -379,6 +383,7 @@ def training_process(args, rank, world_size):
             epochs_since_improvement0 += 1
             if vloss0 < best_vloss0 - 1e-3: # TODO should this be accuracy or loss...?
                 best_vloss0 = vloss0
+                best_val_acc0 = val_acc0
                 epochs_since_improvement0 = 0
                 states['model0_state'] = model0.state_dict()
                 states['optimizer0_state'] = optimizer0.state_dict()
@@ -386,7 +391,8 @@ def training_process(args, rank, world_size):
             if rank == 0:
                 wandb.log({'val_acc0': val_acc0,
                           'vloss0': vloss0,
-                          'best_vloss0': best_vloss0},
+                          'best_vloss0': best_vloss0,
+                          'best_vacc0': best_val_acc0},
                           step=epoch)
                 
             if epochs_since_improvement0 > args.patience: 
@@ -401,6 +407,7 @@ def training_process(args, rank, world_size):
             epochs_since_improvement1 += 1
             if vloss1 < best_vloss1 - 1e-3:
                 best_vloss1 = vloss1
+                best_val_acc1 = val_acc1
                 epochs_since_improvement1 = 0
                 states['model1_state'] = model1.state_dict()
                 states['optimizer1_state'] = optimizer1.state_dict()
@@ -408,13 +415,18 @@ def training_process(args, rank, world_size):
             if rank == 0:
                 wandb.log({'val_acc1': val_acc1,
                           'vloss1': vloss1,
-                          'best_vloss1': best_vloss1},
+                          'best_vloss1': best_vloss1,
+                          'best_vacc1': best_val_acc1},
                           step=epoch + args.epochs)
                 
             if epochs_since_improvement1 > args.patience: 
                 break
 
             scheduler1.step(vloss1)
+
+        # load the best states
+        model0.load_state_dict(states['model0_state'])
+        model1.load_state_dict(states['model1_state'])
         
         cotrain(args, rank, world_size,
                 loader_train0, loader_train1, 
@@ -436,12 +448,12 @@ def training_process(args, rank, world_size):
 
         # Re-instantiate samplers and get DataLoader objects
         sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
-        sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs)
+        sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs, shuffle=False)
         sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, cuda_kwargs)
         sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, cuda_kwargs)
 
         sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
-        sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs)
+        sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs, shuffle=False)
         sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
         sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
 
