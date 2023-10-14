@@ -360,8 +360,9 @@ def training_process(args, rank, world_size):
     sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
     sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
 
+    k = floor(len(data_unlbl0) * args.k)
+
     for c_iter in range(1, args.cotrain_iters + 1):
-        k = floor(len(data_unlbl0) * args.k)
         best_vloss0, best_vloss1 = float("inf"), float("inf")
         best_val_acc0, best_val_acc1 = 0, 0
         epochs_since_improvement0 = 0
