@@ -80,28 +80,44 @@ def remove_collisions(lbl_model0, idx_model0, lbl_model1, idx_model1):
 
     return lbl_model0_np, idx_model0_np, lbl_model1_np, idx_model1_np, idx_colls
 
-def predict(loader, model, num_classes, rank, world_size, device):
+def predict(rank, world_size, batch_size, loader, model, num_classes, device):
     model.eval()
     predictions = []
     with torch.no_grad():
         for X, y in loader:
-            tensor_list = [torch.zeros((X.shape[0], num_classes), 
-                                       dtype=torch.float16)
-                                       .to(device) 
+            # when all-gathering, it may be the case 
+            # some ranks have tensors that are smaller than
+            # the tensor they are being gathered into (...?)
+            tensor_list = [torch.zeros((batch_size, num_classes),
+                                      dtype=torch.float16).to(device) 
                            for _ in range(world_size)]
-            dist.all_gather(tensor_list, model(X.to(device)))
+            output = model(X.to(device))
+            # pad the output so that it contains the same 
+            # number of rows as specified by the batch size
+            diff = batch_size - output.shape[0]
+            pad = torch.full((diff, num_classes), -1,
+                                 dtype=torch.float16).to(device)
+            output = torch.cat((output, pad))
+            dist.all_gather(tensor_list, output)
             batch_outputs = torch.cat(tensor_list)
+            # remove all rows of the tensor that contain a -1
+            # (as this is not a valid value anywhere)
+            mask = ~(batch_outputs == -1).any(-1)
+            batch_outputs = batch_outputs[mask]
             predictions.append(batch_outputs)
     return torch.cat(predictions)
 
 # add top k% of predictions on the unlabeled datasets
 # to the labeled datasets
-def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
-            model0, model1, k, rank, world_size, device):
+def cotrain(args, rank, world_size,
+            loader0, loader1, loader_unlbl0, loader_unlbl1,
+            model0, model1, k, device):
     num_classes = len(loader0.dataset.classes)
-    pred_model0 = predict(loader_unlbl0, model0, num_classes, rank, world_size, device)
-    pred_model1 = predict(loader_unlbl1, model1, num_classes, rank, world_size, device)
-
+    pred_model0 = predict(rank, world_size, args.batch_size,
+                          loader_unlbl0, model0, num_classes, device)
+    pred_model1 = predict(rank, world_size, args.batch_size,
+                          loader_unlbl1, model1, num_classes, device)
+    print(f"Number of unlabeled instances view0 {len(loader_unlbl0.dataset)} view1 {len(loader_unlbl1.dataset)}")
     print(f"shape pred_model0 {pred_model0.shape}\t pred_model1 {pred_model1.shape}")
 
     _, lbl_topk0, idx_topk0 = get_topk_predictions(
@@ -111,7 +127,6 @@ def cotrain(loader0, loader1, loader_unlbl0, loader_unlbl1,
                                     pred_model1, 
                                     k if k <= len(pred_model1) else len(pred_model1))
 
-    print(f"Number of unlabeled instances: {len(loader_unlbl0.dataset)}")
 
     # if two models predict confidently on the same instance,
     # find and remove conflicting predictions from the lists
@@ -401,10 +416,10 @@ def training_process(args, rank, world_size):
 
             scheduler1.step(vloss1)
         
-        cotrain(loader_train0, loader_train1, 
+        cotrain(args, rank, world_size,
+                loader_train0, loader_train1, 
                 loader_unlbl0, loader_unlbl1, 
-                model0, model1, k,
-                rank, world_size, device)
+                model0, model1, k,device)
 
         test_acc0, test_loss0 = test(args, rank, world_size, loader_test0, model0, device)
         test_acc1, test_loss1 = test(args, rank, world_size, loader_test1, model1, device)
@@ -419,16 +434,16 @@ def training_process(args, rank, world_size):
         if rank == 0:
             wandb.finish()
 
-        # Re-instantiate samplers and DataLoader objects
-        sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
-        sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs)
-        sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, cuda_kwargs)
-        sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, cuda_kwargs)
+    # Re-instantiate samplers and get DataLoader objects
+    sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
+    sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs)
+    sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, cuda_kwargs)
+    sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, cuda_kwargs)
 
-        sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
-        sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs)
-        sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
-        sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
+    sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
+    sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs)
+    sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
+    sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
 
     dist.barrier()
 
