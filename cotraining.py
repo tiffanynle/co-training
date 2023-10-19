@@ -264,12 +264,12 @@ class EarlyStopper:
     # TODO perhaps there is a more elegant way to write this
     def is_new_best_metric(self, val_acc, val_loss):
         self.epochs_since_improvement += 1
-        if self.stopping_metric == 'val_loss' and val_loss < self.best_val_loss - 1e-3:
+        if self.stopping_metric == 'loss' and val_loss < self.best_val_loss - 1e-3:
             self.best_val_loss = val_loss
             self.best_val_acc = val_acc
             self.epochs_since_improvement = 0
             return True
-        elif self.stopping_metric == 'val_acc' and val_acc > self.best_val_acc + 1e-3:
+        elif self.stopping_metric == 'accuracy' and val_acc > self.best_val_acc + 1e-3:
             self.best_val_loss = val_loss
             self.best_val_acc = val_acc
             self.epochs_since_improvement = 0
@@ -514,8 +514,8 @@ def create_parser():
                             co-training iteration (default: 0.05)')
     parser.add_argument('--percent_unlabeled', type=float, default=0.75,
                         help='percentage of unlabeled samples to start with (default: 0.75)')
-    parser.add_argument('--stopping_metric', choices=['loss', 'accuracy'],
-                        help='metric to use for early stopping (options: \'loss\', \'accuracy\')')
+    parser.add_argument('--stopping_metric', type=str, default='accuracy', choices=['loss', 'accuracy'],
+                        help='metric to use for early stopping (default: %(default)s)')
     # TODO add additional arguments
     
     return parser
