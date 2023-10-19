@@ -15,7 +15,7 @@ def add_to_imagefolder(paths, labels, dataset):
 
     dataset.samples += new_samples
 
-    return dataset.samples
+    return dataset
 
 # splits the datasets of the two views so that
 # the instances inside are still aligned by index

@@ -60,8 +60,6 @@ def remove_collisions(lbl_model0, idx_model0, lbl_model1, idx_model1):
     mask_coll = lbl_model0_np[idx_inter0] != lbl_model1_np[idx_inter1]
     idx_colls = inter[mask_coll]
 
-    print(f"mask_coll: {mask_coll}")
-
     # TODO may also want to return the predicted labels for the collisions
     if (len(idx_colls) > 0):
         print(f"idx_cols: {idx_colls}")
@@ -86,23 +84,26 @@ def predict(rank, world_size, batch_size, loader, model, num_classes, device):
     softmax = torch.nn.Softmax(-1)
     with torch.no_grad():
         for X, y in loader:
-            # when all-gathering, it may be the case 
-            # some ranks have tensors that are smaller than
-            # the tensor they are being gathered into (...?)
             tensor_list = [torch.full((batch_size, num_classes), -1,
                                       dtype=torch.float16).to(device) 
                            for _ in range(world_size)]
             output = softmax(model(X.to(device)))
-            pad = torch.full((batch_size, num_classes), -1, dtype=torch.float16).to(device)
-            pad[:output.shape[0]] = output
+
             # pad the output so that it contains the same 
             # number of rows as specified by the batch size
+            pad = torch.full((batch_size, num_classes), -1, 
+                             dtype=torch.float16).to(device)
+            pad[:output.shape[0]] = output
+
+            # all-gather the full list of predictions across all processes
             dist.all_gather(tensor_list, pad)
             batch_outputs = torch.cat(tensor_list)
+
             # remove all rows of the tensor that contain a -1
             # (as this is not a valid value anywhere)
             mask = ~(batch_outputs == -1).any(-1)
             batch_outputs = batch_outputs[mask]
+
             predictions.append(batch_outputs)
     return torch.cat(predictions)
 
@@ -123,15 +124,17 @@ def cotrain(args, rank, world_size,
     dist.broadcast(pred_model0, 0)
     dist.broadcast(pred_model1, 0)
 
-    print(f"Number of unlabeled instances view0 {len(loader_unlbl0.dataset)} view1 {len(loader_unlbl1.dataset)}")
-    print(f"shape pred_model0 {pred_model0.shape}\t pred_model1 {pred_model1.shape}")
-
+    print("Number of unlabeled instances view0: {} view1: {}"
+          .format(len(loader_unlbl0.dataset), len(loader_unlbl1.dataset)))
+    
     _, lbl_topk0, idx_topk0 = get_topk_predictions(
                                     pred_model0,
-                                    k if k <= len(pred_model0) else len(pred_model0))
+                                    k if k <= len(pred_model0) 
+                                    else len(pred_model0))
     _, lbl_topk1, idx_topk1 = get_topk_predictions(
                                     pred_model1, 
-                                    k if k <= len(pred_model1) else len(pred_model1))
+                                    k if k <= len(pred_model1) 
+                                    else len(pred_model1))
 
 
     # if two models predict confidently on the same instance,
@@ -141,10 +144,6 @@ def cotrain(args, rank, world_size,
 
     samples_unlbl0 = np.stack([np.array(a) for a in loader_unlbl0.dataset.samples])
     samples_unlbl1 = np.stack([np.array(a) for a in loader_unlbl1.dataset.samples])
-
-    print("shape samples_unlbl0: {}\t samples_unlbl1: {}\t idx_topk0: {}\t idx_topk1: {}"
-          .format(samples_unlbl0.shape, samples_unlbl1.shape,
-                  idx_topk0.shape, idx_topk1.shape))
 
     if len(idx_colls) > 0:
         print("\nImage paths of collisions:\n unlbl0:\n {}\n unlbl1:\n {}\n"
@@ -160,8 +159,10 @@ def cotrain(args, rank, world_size,
     paths1 = [i for i, _ in list_samples1]
 
     # add pseudolabeled instances to the labeled datasets
-    loader0.dataset.samples = add_to_imagefolder(paths0, lbl_topk1.tolist(), loader0.dataset)
-    loader1.dataset.samples = add_to_imagefolder(paths1, lbl_topk0.tolist(), loader1.dataset)
+    data_labeled0 = add_to_imagefolder(paths0, lbl_topk1.tolist(), loader0.dataset)
+    data_labeled1 = add_to_imagefolder(paths1, lbl_topk0.tolist(), loader1.dataset)
+    loader0.dataset.samples = data_labeled0.samples
+    loader1.dataset.samples = data_labeled1.samples
 
     # remove instances from unlabeled dataset
     mask = np.ones(len(loader_unlbl0.dataset), dtype=bool)
@@ -192,20 +193,13 @@ def train(args, rank, world_size, loader, model, optimizer, epoch, device,
     for batch, (X, y) in enumerate(loader):
         X, y = X.to(device), y.to(device)
         optimizer.zero_grad()
-
-        # Compute prediction error
         output = model(X)
         loss = loss_fn(output, y)
-
-        # Backpropagation
         loss.backward()
         optimizer.step()
-
-        # Calculate accuracy, loss (locally)
         ddp_loss[0] += loss.item()
         ddp_loss[1] += (output.argmax(1) == y).type(torch.float).sum().item()
         ddp_loss[2] += len(X)
-
     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
 
     if rank == 0:
@@ -226,9 +220,7 @@ def test(args, rank, world_size, loader, model, device):
             ddp_loss[0] += loss.item()
             ddp_loss[1] += (output.argmax(1) == y).type(torch.float).sum().item()
             ddp_loss[2] += len(X)
-    
     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
-
     test_acc = ddp_loss[1] / ddp_loss[2] 
     test_loss = ddp_loss[0] / ddp_loss[2]
 
@@ -257,18 +249,48 @@ def create_sampler_loader(args, rank, world_size, data, cuda_kwargs, shuffle=Tru
 
     loader = DataLoader(data, **loader_kwargs)
 
-    return sampler, loader    
+    return sampler, loader
 
+class EarlyStopper:
+    def __init__(self, stopping_metric, patience):
+        self.stopping_metric = stopping_metric
+        self.patience = patience
+        self.epochs_since_improvement = 0
+        self.stop = False 
+
+        self.best_val_loss = float("inf")
+        self.best_val_acc = 0
+
+    # TODO perhaps there is a more elegant way to write this
+    def is_new_best_metric(self, val_acc, val_loss):
+        self.epochs_since_improvement += 1
+        if self.stopping_metric == 'val_loss' and val_loss < self.best_val_loss - 1e-3:
+            self.best_val_loss = val_loss
+            self.best_val_acc = val_acc
+            self.epochs_since_improvement = 0
+            return True
+        elif self.stopping_metric == 'val_acc' and val_acc > self.best_val_acc + 1e-3:
+            self.best_val_loss = val_loss
+            self.best_val_acc = val_acc
+            self.epochs_since_improvement = 0
+            return True
+        return False
+    
+    def early_stop(self):
+        if self.epochs_since_improvement > self.patience: 
+            return True
+        return False
+        
 def training_process(args, rank, world_size):
     random.seed(13)
 
     with open('cotraining_samples_lists_fixed.pkl', 'rb') as fp:
         data = pickle.load(fp)
 
-    # split data into labeled/unlabeled (25/75 split)
+    # split data into labeled/unlabeled
     samples_train0, samples_unlbl0, samples_train1, samples_unlbl1 = \
         train_test_split_samples(data['labeled'], data['inferred'],
-                                test_size=0.75, random_state=13)
+                                test_size=args.percent_unlabeled, random_state=13)
         
     # split the data so we get 70/10/20 train/val/test
     samples_train0, samples_test0, samples_train1, samples_test1 = \
@@ -361,12 +383,7 @@ def training_process(args, rank, world_size):
     sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
 
     k = floor(len(data_unlbl0) * args.k)
-
-    for c_iter in range(1, args.cotrain_iters + 1):
-        best_vloss0, best_vloss1 = float("inf"), float("inf")
-        best_val_acc0, best_val_acc1 = 0, 0
-        epochs_since_improvement0 = 0
-        epochs_since_improvement1 = 0
+    for c_iter in range(1, args.cotrain_iters + 1):        
         # if there's no more unlabeled examples for co-training, stop the process
         if len(loader_unlbl0.dataset) == 0 and len(loader_unlbl1.dataset) == 0: 
             break
@@ -377,53 +394,48 @@ def training_process(args, rank, world_size):
             config={'args': vars(args)})
             print(f"Co-Training Iteration: {c_iter}\n---------------------------------------")
         
+        stopper0 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
+        stopper1 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
+
         for epoch in range(1, args.epochs + 1):
             train(args, rank, world_size, loader_train0, model0, optimizer0, epoch, device, sampler_train0)
-            val_acc0, vloss0 = test(args, rank, world_size, loader_val0, model0, device)
+            val_acc0, val_loss0 = test(args, rank, world_size, loader_val0, model0, device)
 
-            epochs_since_improvement0 += 1
-            if vloss0 < best_vloss0 - 1e-3: # TODO should this be accuracy or loss...?
-                best_vloss0 = vloss0
-                best_val_acc0 = val_acc0
-                epochs_since_improvement0 = 0
+            if stopper0.is_new_best_metric(val_acc0, val_loss0):
                 states['model0_state'] = model0.state_dict()
                 states['optimizer0_state'] = optimizer0.state_dict()
-            
+
             if rank == 0:
                 wandb.log({'val_acc0': val_acc0,
-                          'vloss0': vloss0,
-                          'best_vloss0': best_vloss0,
-                          'best_vacc0': best_val_acc0},
+                          'vloss0': val_loss0,
+                          'best_val_loss0': stopper0.best_val_loss,
+                          'best_val_acc0': stopper0.best_val_acc},
                           step=epoch)
-                
-            if epochs_since_improvement0 > args.patience: 
+
+            if stopper0.early_stop():
                 break
 
-            scheduler0.step(vloss0)
+            scheduler0.step(val_loss0)
         
         for epoch in range(1, args.epochs + 1):
             train(args, rank, world_size, loader_train1, model1, optimizer1, epoch, device, sampler_train1)
-            val_acc1, vloss1 = test(args, rank, world_size, loader_val1, model1, device)
+            val_acc1, val_loss1 = test(args, rank, world_size, loader_val1, model1, device)
 
-            epochs_since_improvement1 += 1
-            if vloss1 < best_vloss1 - 1e-3:
-                best_vloss1 = vloss1
-                best_val_acc1 = val_acc1
-                epochs_since_improvement1 = 0
+            if stopper1.is_new_best_metric(val_acc1, val_loss1):
                 states['model1_state'] = model1.state_dict()
-                states['optimizer1_state'] = optimizer1.state_dict()
+                states['optimizer1_state'] = optimizer1.state_dict()               
             
             if rank == 0:
                 wandb.log({'val_acc1': val_acc1,
-                          'vloss1': vloss1,
-                          'best_vloss1': best_vloss1,
-                          'best_vacc1': best_val_acc1},
+                          'vloss1': val_loss1,
+                          'best_vloss1': stopper1.best_val_loss,
+                          'best_vacc1': stopper1.best_val_acc},
                           step=epoch + args.epochs)
-                
-            if epochs_since_improvement1 > args.patience: 
+            
+            if stopper1.early_stop():
                 break
 
-            scheduler1.step(vloss1)
+            scheduler1.step(val_loss1)
 
         # load the best states
         model0.load_state_dict(states['model0_state'])
@@ -490,9 +502,9 @@ def create_parser():
     parser.add_argument('-tb', '--test_batch_size', type=int, default=64, 
                         help='test batch size for training (default: 64)')
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-3,
-                        help='learning rate for SGD (default 1e-3)')
+                        help='learning rate for SGD (default: 1e-3)')
     parser.add_argument('-m', '--momentum', type=float, default=0.9,
-                        help='momentum for SGD (default 0.9')
+                        help='momentum for SGD (default: 0.9')
     parser.add_argument('-p', '--patience', type=float, default=10,
                         help='number of epochs to train for without improvement (default: 10)')
     parser.add_argument('--cotrain_iters', type=int, default=25,
@@ -500,6 +512,10 @@ def create_parser():
     parser.add_argument('--k', type=float, default=0.05,
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.05)')
+    parser.add_argument('--percent_unlabeled', type=float, default=0.75,
+                        help='percentage of unlabeled samples to start with (default: 0.75)')
+    parser.add_argument('--stopping_metric', choices=['loss', 'accuracy'],
+                        help='metric to use for early stopping (options: \'loss\', \'accuracy\')')
     # TODO add additional arguments
     
     return parser
