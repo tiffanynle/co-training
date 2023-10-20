@@ -26,6 +26,7 @@ import pickle
 import copy
 import random
 from math import floor
+import gc
 
 from utils import add_to_imagefolder, train_test_split_samples
 
@@ -363,6 +364,37 @@ def training_process(args, rank, world_size):
     k = floor(len(data_unlbl0) * args.k)
 
     for c_iter in range(1, args.cotrain_iters + 1):
+        if args.from_scratch and c_iter > 1:
+            # instantiate models, send to device 
+            #del model0
+            #del model1
+            model0, model1 = resnet50(num_classes=3).to(device), resnet50(num_classes=3).to(device)
+            
+            # wrapping to take advantage of FSDP
+            model0 = FSDP(model0, 
+                        auto_wrap_policy=auto_wrap_policy,
+                        mixed_precision=torch.distributed.fsdp.MixedPrecision(
+                            param_dtype=torch.float16, 
+                            reduce_dtype=torch.float32, 
+                            buffer_dtype=torch.float32, 
+                            cast_forward_inputs=True)
+                            )
+
+            model1 = FSDP(model1, 
+                        auto_wrap_policy=auto_wrap_policy,
+                        mixed_precision=torch.distributed.fsdp.MixedPrecision(
+                            param_dtype=torch.float16, 
+                            reduce_dtype=torch.float32, 
+                            buffer_dtype=torch.float32, 
+                            cast_forward_inputs=True)
+                            )
+
+            optimizer0 = optim.SGD(model0.parameters(), lr=args.learning_rate, momentum=args.momentum)
+            optimizer1 = optim.SGD(model1.parameters(), lr=args.learning_rate, momentum=args.momentum)
+            
+            scheduler0 = ReduceLROnPlateau(optimizer0)
+            scheduler1 = ReduceLROnPlateau(optimizer1)
+
         best_vloss0, best_vloss1 = float("inf"), float("inf")
         best_val_acc0, best_val_acc1 = 0, 0
         epochs_since_improvement0 = 0
@@ -374,18 +406,18 @@ def training_process(args, rank, world_size):
         if rank == 0:
             wandb.init(project='Co-Training', entity='ai2es',
             name=f"{rank}: Co-Training - {c_iter}",
-            config={'args': vars(args)})
+            config={'args': vars(args), 'c_iter': c_iter})
             print(f"Co-Training Iteration: {c_iter}\n---------------------------------------")
+
+        stopper0 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
+        stopper1 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
         
         for epoch in range(1, args.epochs + 1):
+            gc.collect()
             train(args, rank, world_size, loader_train0, model0, optimizer0, epoch, device, sampler_train0)
             val_acc0, vloss0 = test(args, rank, world_size, loader_val0, model0, device)
 
-            epochs_since_improvement0 += 1
-            if vloss0 < best_vloss0 - 1e-3: # TODO should this be accuracy or loss...?
-                best_vloss0 = vloss0
-                best_val_acc0 = val_acc0
-                epochs_since_improvement0 = 0
+            if stopper0.is_new_best_metric(val_acc0, val_loss0):
                 states['model0_state'] = model0.state_dict()
                 states['optimizer0_state'] = optimizer0.state_dict()
             
@@ -399,19 +431,18 @@ def training_process(args, rank, world_size):
             if epochs_since_improvement0 > args.patience: 
                 break
 
+            if stopper0.early_stop():
+                break
+
             scheduler0.step(vloss0)
         
         for epoch in range(1, args.epochs + 1):
             train(args, rank, world_size, loader_train1, model1, optimizer1, epoch, device, sampler_train1)
             val_acc1, vloss1 = test(args, rank, world_size, loader_val1, model1, device)
 
-            epochs_since_improvement1 += 1
-            if vloss1 < best_vloss1 - 1e-3:
-                best_vloss1 = vloss1
-                best_val_acc1 = val_acc1
-                epochs_since_improvement1 = 0
+            if stopper1.is_new_best_metric(val_acc1, val_loss1):
                 states['model1_state'] = model1.state_dict()
-                states['optimizer1_state'] = optimizer1.state_dict()
+                states['optimizer1_state'] = optimizer1.state_dict() 
             
             if rank == 0:
                 wandb.log({'val_acc1': val_acc1,
@@ -419,6 +450,9 @@ def training_process(args, rank, world_size):
                           'best_vloss1': best_vloss1,
                           'best_vacc1': best_val_acc1},
                           step=epoch + args.epochs)
+
+            if stopper1.early_stop():
+                break
                 
             if epochs_since_improvement1 > args.patience: 
                 break
@@ -433,7 +467,7 @@ def training_process(args, rank, world_size):
                 loader_train0, loader_train1, 
                 loader_unlbl0, loader_unlbl1, 
                 model0, model1, k,device)
-        
+        # TODO: store these values as a function of epoch
         test_acc0, test_loss0 = test(args, rank, world_size, loader_test0, model0, device)
         test_acc1, test_loss1 = test(args, rank, world_size, loader_test1, model1, device)
 
@@ -476,31 +510,34 @@ def main(args, rank, world_size):
     states, metrics = training_process(args, rank, world_size)
 
     if rank == 0:
-        torch.save(states, '/home/scratch/tiffanyle/cotraining/states.pth')
+        torch.save(states, '/scratch/tiffanyle/cotraining/states.pth')
 
     cleanup()
         
 def create_parser():
     parser = argparse.ArgumentParser(description='co-training')
     
-    parser.add_argument('-e', '--epochs', type=int, default=10, 
+    parser.add_argument('-e', '--epochs', type=int, default=100, 
                         help='training epochs (default: 10)')
-    parser.add_argument('-b', '--batch_size', type=int, default=64, 
+    parser.add_argument('-b', '--batch_size', type=int, default=256, 
                         help='batch size for training (default: 64)')
-    parser.add_argument('-tb', '--test_batch_size', type=int, default=64, 
+    parser.add_argument('-tb', '--test_batch_size', type=int, default=256, 
                         help='test batch size for training (default: 64)')
-    parser.add_argument('-lr', '--learning_rate', type=float, default=1e-3,
+    parser.add_argument('-lr', '--learning_rate', type=float, default=0.1,
                         help='learning rate for SGD (default 1e-3)')
     parser.add_argument('-m', '--momentum', type=float, default=0.9,
                         help='momentum for SGD (default 0.9')
-    parser.add_argument('-p', '--patience', type=float, default=10,
+    parser.add_argument('-p', '--patience', type=float, default=32,
                         help='number of epochs to train for without improvement (default: 10)')
-    parser.add_argument('--cotrain_iters', type=int, default=25,
+    parser.add_argument('--cotrain_iters', type=int, default=10,
                         help='max number of iterations for co-training (default: 25)')
-    parser.add_argument('--k', type=float, default=0.05,
+    parser.add_argument('--k', type=float, default=0.1,
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.05)')
-    # TODO add additional arguments
+    parser.add_argument('-sc', '--from_scratch', action='store_true', default=False,
+                        help='retrain the model from initialization at each iteration.')
+    parser.add_argument('--stopping_metric', type=str, default='accuracy', choices=['loss', 'accuracy'],
+                        help='metric to use for early stopping (default: %(default)s)')
     
     return parser
 
