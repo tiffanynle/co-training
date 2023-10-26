@@ -36,6 +36,7 @@ def get_topk_predictions(pred, k):
     idx = torch.argsort(prob, descending=True)[:k]
     return prob[idx], label[idx], idx
 
+
 # TODO extract some of the logic into another function (so messy...)
 def remove_collisions(lbl_model0, idx_model0, lbl_model1, idx_model1):
     # convert tensors to np arrays, as mixing use of tensors
@@ -78,6 +79,7 @@ def remove_collisions(lbl_model0, idx_model0, lbl_model1, idx_model1):
 
     return lbl_model0_np, idx_model0_np, lbl_model1_np, idx_model1_np, idx_colls
 
+
 def predict(rank, world_size, batch_size, loader, model, num_classes, device):
     model.eval()
     predictions = []
@@ -103,9 +105,10 @@ def predict(rank, world_size, batch_size, loader, model, num_classes, device):
             # (as this is not a valid value anywhere)
             mask = ~(batch_outputs == -1).any(-1)
             batch_outputs = batch_outputs[mask]
-
             predictions.append(batch_outputs)
+
     return torch.cat(predictions)
+
 
 # add top k% of predictions on the unlabeled datasets
 # to the labeled datasets
@@ -182,6 +185,7 @@ def cotrain(args, rank, world_size,
 
     print(f"Remaining number of unlabeled instances: {len(loader_unlbl0.dataset)}")
 
+
 def train(args, rank, world_size, loader, model, optimizer, epoch, device,
           sampler=None):
     if sampler:
@@ -208,6 +212,7 @@ def train(args, rank, world_size, loader, model, optimizer, epoch, device,
                       100*(ddp_loss[1] / ddp_loss[2]), 
                       ddp_loss[0] / ddp_loss[2]))
 
+
 def test(args, rank, world_size, loader, model, device):
     loss_fn = torch.nn.CrossEntropyLoss()
     ddp_loss = torch.zeros(3).to(device)
@@ -230,6 +235,7 @@ def test(args, rank, world_size, loader, model, device):
 
     return test_acc, test_loss
 
+
 def create_imagefolder(data, samples, path, transform, new_path=None):
     imgfolder = datasets.ImageFolder(path, transform=transform)
     imgfolder.class_to_idx = data['class_map']
@@ -241,10 +247,10 @@ def create_imagefolder(data, samples, path, transform, new_path=None):
 
     return imgfolder
 
-def create_sampler_loader(args, rank, world_size, data, cuda_kwargs, shuffle=True):
+def create_sampler_loader(args, rank, world_size, data, batch_size, cuda_kwargs, shuffle=True):
     sampler = DistributedSampler(data, rank=rank, num_replicas=world_size, shuffle=shuffle)
 
-    loader_kwargs = {'batch_size': args.batch_size, 'sampler': sampler}
+    loader_kwargs = {'batch_size': batch_size, 'sampler': sampler}
     loader_kwargs.update(cuda_kwargs)
 
     loader = DataLoader(data, **loader_kwargs)
@@ -256,13 +262,12 @@ class EarlyStopper:
         self.stopping_metric = stopping_metric
         self.patience = patience
         self.epochs_since_improvement = 0
-        self.stop = False 
 
         self.best_val_loss = float("inf")
         self.best_val_acc = 0
 
-    # TODO perhaps there is a more elegant way to write this
-    def is_new_best_metric(self, val_acc, val_loss):
+    # TODO surely there is a nicer way to write this
+    def update_new_best_metric(self, val_acc, val_loss):
         self.epochs_since_improvement += 1
         if self.stopping_metric == 'loss' and val_loss < self.best_val_loss - 1e-3:
             self.best_val_loss = val_loss
@@ -280,7 +285,79 @@ class EarlyStopper:
         if self.epochs_since_improvement > self.patience: 
             return True
         return False
-        
+
+# TODO clean this
+def train_wrapper(args, rank, world_size, 
+                  loader_train, loader_val, loader_test, sampler_train, 
+                  model, optimizer, scheduler, stopper, 
+                  states, states_keys, log_keys, device):
+    for epoch in range(1, args.epochs + 1):
+        train(args, rank, world_size, loader_train, model, optimizer, epoch, device, sampler_train)
+        val_acc, val_loss = test(args, rank, world_size, loader_val, model, device)
+        test_acc, test_loss = test(args, rank, world_size, loader_test, model, device)
+
+        if stopper.update_new_best_metric(val_acc, val_loss):
+            states_values = [model.state_dict(), optimizer.state_dict()]
+            update_dict_kv_pairs(states, states_keys, states_values)
+
+        if rank == 0:
+            log_vals = [val_acc, val_loss, 
+                        stopper.best_val_acc, stopper.best_val_loss, 
+                        test_acc, test_loss]
+            log = create_wandb_log(log_keys, log_vals)
+            wandb.log(log, step=epoch if 'model0_state' in states_keys else epoch + args.epochs)
+
+        if stopper.early_stop():
+            break
+
+        scheduler.step(val_loss)
+
+
+def update_dict_kv_pairs(d, dkeys, dvals):
+    assert len(dkeys) == len(dvals), \
+    "Number of keys, values to update in dict are not equal"
+    for k, v in zip(dkeys, dvals):
+        d[k] = v
+
+def create_wandb_log(log_keys, log_vals):
+    assert len(log_keys) == len(log_vals), \
+    "Number of keys, values are not equal"
+    d = dict()
+    for k, v in zip(log_keys, log_vals):
+        d[k] = v
+    return d
+
+def create_models(args, auto_wrap_policy, device):
+       # instantiate models, send to device 
+    model0, model1 = resnet50(num_classes=3).to(device), resnet50(num_classes=3).to(device)
+    
+    # wrapping to take advantage of FSDP
+    model0 = FSDP(model0, 
+                 auto_wrap_policy=auto_wrap_policy,
+                 mixed_precision=torch.distributed.fsdp.MixedPrecision(
+                     param_dtype=torch.float16, 
+                     reduce_dtype=torch.float32, 
+                     buffer_dtype=torch.float32, 
+                     cast_forward_inputs=True)
+                    )
+
+    model1 = FSDP(model1, 
+                 auto_wrap_policy=auto_wrap_policy,
+                 mixed_precision=torch.distributed.fsdp.MixedPrecision(
+                     param_dtype=torch.float16, 
+                     reduce_dtype=torch.float32, 
+                     buffer_dtype=torch.float32, 
+                     cast_forward_inputs=True)
+                     )
+
+    optimizer0 = optim.SGD(model0.parameters(), lr=args.learning_rate, momentum=args.momentum)
+    optimizer1 = optim.SGD(model1.parameters(), lr=args.learning_rate, momentum=args.momentum)
+    
+    scheduler0 = ReduceLROnPlateau(optimizer0)
+    scheduler1 = ReduceLROnPlateau(optimizer1)
+
+    return model0, model1, optimizer0, optimizer1, scheduler0, scheduler1
+
 def training_process(args, rank, world_size):
     random.seed(13)
 
@@ -335,33 +412,7 @@ def training_process(args, rank, world_size):
     device = torch.device(rank % torch.cuda.device_count())
     torch.cuda.set_device(device)
 
-    # instantiate models, send to device 
-    model0, model1 = resnet50(num_classes=3).to(device), resnet50(num_classes=3).to(device)
-    
-    # wrapping to take advantage of FSDP
-    model0 = FSDP(model0, 
-                 auto_wrap_policy=auto_wrap_policy,
-                 mixed_precision=torch.distributed.fsdp.MixedPrecision(
-                     param_dtype=torch.float16, 
-                     reduce_dtype=torch.float32, 
-                     buffer_dtype=torch.float32, 
-                     cast_forward_inputs=True)
-                    )
-
-    model1 = FSDP(model1, 
-                 auto_wrap_policy=auto_wrap_policy,
-                 mixed_precision=torch.distributed.fsdp.MixedPrecision(
-                     param_dtype=torch.float16, 
-                     reduce_dtype=torch.float32, 
-                     buffer_dtype=torch.float32, 
-                     cast_forward_inputs=True)
-                     )
-
-    optimizer0 = optim.SGD(model0.parameters(), lr=args.learning_rate, momentum=args.momentum)
-    optimizer1 = optim.SGD(model1.parameters(), lr=args.learning_rate, momentum=args.momentum)
-    
-    scheduler0 = ReduceLROnPlateau(optimizer0)
-    scheduler1 = ReduceLROnPlateau(optimizer1)
+    model0, model1, optimizer0, optimizer1, scheduler0, scheduler1 = create_models(args, auto_wrap_policy, device)
 
     cuda_kwargs = {'num_workers': 12, 'pin_memory': True, 'shuffle': False}
 
@@ -371,16 +422,24 @@ def training_process(args, rank, world_size):
         'model1_state': model1.state_dict(),
         'optimizer1_state': optimizer1.state_dict()}
 
-    # Instantiate samplers and get DataLoader objects
-    sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
-    sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs, shuffle=False)
-    sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, cuda_kwargs)
-    sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, cuda_kwargs)
+    # ...    
+    states_keys0 = ['model0_state', 'optimizer0_state']
+    states_keys1 = ['model1_state', 'optimizer1_state']
 
-    sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
-    sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs, shuffle=False)
-    sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
-    sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
+    # ...
+    log_keys0 = ['val_acc0', 'val_loss0', 'best_val_acc0', 'best_val_loss0', 'test_acc0', 'test_loss0']
+    log_keys1 = ['val_acc1', 'val_loss1', 'best_val_acc1', 'best_val_loss1', 'test_acc1', 'test_loss1']
+
+    # Instantiate samplers and get DataLoader objects
+    sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, args.batch_size, cuda_kwargs)
+    sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, args.batch_size, cuda_kwargs, shuffle=False)
+    sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, args.batch_size, cuda_kwargs)
+    sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, args.test_batch_size, cuda_kwargs)
+
+    sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, args.batch_size, cuda_kwargs)
+    sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, args.batch_size, cuda_kwargs, shuffle=False)
+    sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, args.batch_size, cuda_kwargs)
+    sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, args.test_batch_size, cuda_kwargs)
 
     k = floor(len(data_unlbl0) * args.k)
     for c_iter in range(1, args.cotrain_iters + 1):        
@@ -393,49 +452,22 @@ def training_process(args, rank, world_size):
             name=f"{rank}: Co-Training - {c_iter}",
             config={'args': vars(args)})
             print(f"Co-Training Iteration: {c_iter}\n---------------------------------------")
-        
+
+#        if args.from_scratch and c_iter > 1:
+#            model0, model1, optimizer0, optimizer1, scheduler0, scheduler1 = create_models(args, auto_wrap_policy, device)
+
         stopper0 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
         stopper1 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
 
-        for epoch in range(1, args.epochs + 1):
-            train(args, rank, world_size, loader_train0, model0, optimizer0, epoch, device, sampler_train0)
-            val_acc0, val_loss0 = test(args, rank, world_size, loader_val0, model0, device)
+        train_wrapper(args, rank, world_size, 
+                      loader_train0, loader_val0, loader_test0, sampler_train0,
+                      model0, optimizer0, scheduler0, stopper0,
+                      states, states_keys0, log_keys0, device)
 
-            if stopper0.is_new_best_metric(val_acc0, val_loss0):
-                states['model0_state'] = model0.state_dict()
-                states['optimizer0_state'] = optimizer0.state_dict()
-
-            if rank == 0:
-                wandb.log({'val_acc0': val_acc0,
-                          'vloss0': val_loss0,
-                          'best_val_loss0': stopper0.best_val_loss,
-                          'best_val_acc0': stopper0.best_val_acc},
-                          step=epoch)
-
-            if stopper0.early_stop():
-                break
-
-            scheduler0.step(val_loss0)
-        
-        for epoch in range(1, args.epochs + 1):
-            train(args, rank, world_size, loader_train1, model1, optimizer1, epoch, device, sampler_train1)
-            val_acc1, val_loss1 = test(args, rank, world_size, loader_val1, model1, device)
-
-            if stopper1.is_new_best_metric(val_acc1, val_loss1):
-                states['model1_state'] = model1.state_dict()
-                states['optimizer1_state'] = optimizer1.state_dict()               
-            
-            if rank == 0:
-                wandb.log({'val_acc1': val_acc1,
-                          'vloss1': val_loss1,
-                          'best_vloss1': stopper1.best_val_loss,
-                          'best_vacc1': stopper1.best_val_acc},
-                          step=epoch + args.epochs)
-            
-            if stopper1.early_stop():
-                break
-
-            scheduler1.step(val_loss1)
+        train_wrapper(args, rank, world_size, 
+                      loader_train1, loader_val1, loader_test1, sampler_train1,
+                      model1, optimizer1, scheduler1, stopper1,
+                      states, states_keys1, log_keys1, device)
 
         # load the best states
         model0.load_state_dict(states['model0_state'])
@@ -445,30 +477,20 @@ def training_process(args, rank, world_size):
                 loader_train0, loader_train1, 
                 loader_unlbl0, loader_unlbl1, 
                 model0, model1, k,device)
-        
-        test_acc0, test_loss0 = test(args, rank, world_size, loader_test0, model0, device)
-        test_acc1, test_loss1 = test(args, rank, world_size, loader_test1, model1, device)
-
-        if rank == 0:
-            wandb.log({'test_acc0': test_acc0,
-                       'test_loss0': test_loss0,
-                       'test_acc1' : test_acc1,
-                       'test_loss1': test_loss1},
-                       step=None)
 
         if rank == 0:
             wandb.finish()
 
         # Re-instantiate samplers and get DataLoader objects
-        sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, cuda_kwargs)
-        sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, cuda_kwargs, shuffle=False)
-        sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, cuda_kwargs)
-        sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, cuda_kwargs)
+        sampler_train0, loader_train0 = create_sampler_loader(args, rank, world_size, data_train0, args.batch_size, cuda_kwargs)
+        sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0, args.batch_size, cuda_kwargs, shuffle=False)
+        sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0, args.batch_size, cuda_kwargs)
+        sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0, args.test_batch_size, cuda_kwargs)
 
-        sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, cuda_kwargs)
-        sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, cuda_kwargs, shuffle=False)
-        sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, cuda_kwargs)
-        sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, cuda_kwargs)
+        sampler_train1, loader_train1 = create_sampler_loader(args, rank, world_size, data_train1, args.batch_size, cuda_kwargs)
+        sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1, args.batch_size, cuda_kwargs, shuffle=False)
+        sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1, args.batch_size, cuda_kwargs)
+        sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, args.test_batch_size, cuda_kwargs)
 
     dist.barrier()
 
@@ -495,27 +517,29 @@ def main(args, rank, world_size):
 def create_parser():
     parser = argparse.ArgumentParser(description='co-training')
     
-    parser.add_argument('-e', '--epochs', type=int, default=10, 
-                        help='training epochs (default: 10)')
+    parser.add_argument('-e', '--epochs', type=int, default=100, 
+                        help='training epochs (default: 100)')
     parser.add_argument('-b', '--batch_size', type=int, default=64, 
                         help='batch size for training (default: 64)')
     parser.add_argument('-tb', '--test_batch_size', type=int, default=64, 
-                        help='test batch size for training (default: 64)')
+                        help=' batch size for testing (default: 64)')
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-3,
                         help='learning rate for SGD (default: 1e-3)')
     parser.add_argument('-m', '--momentum', type=float, default=0.9,
                         help='momentum for SGD (default: 0.9')
-    parser.add_argument('-p', '--patience', type=float, default=10,
-                        help='number of epochs to train for without improvement (default: 10)')
-    parser.add_argument('--cotrain_iters', type=int, default=25,
-                        help='max number of iterations for co-training (default: 25)')
-    parser.add_argument('--k', type=float, default=0.05,
+    parser.add_argument('-p', '--patience', type=float, default=32,
+                        help='number of epochs to train for without improvement (default: 32)')
+    parser.add_argument('--cotrain_iters', type=int, default=100,
+                        help='max number of iterations for co-training (default: 100)')
+    parser.add_argument('--k', type=float, default=0.025,
                         help='percentage of unlabeled samples to bring in each \
-                            co-training iteration (default: 0.05)')
+                            co-training iteration (default: 0.025)')
     parser.add_argument('--percent_unlabeled', type=float, default=0.75,
                         help='percentage of unlabeled samples to start with (default: 0.75)')
     parser.add_argument('--stopping_metric', type=str, default='accuracy', choices=['loss', 'accuracy'],
                         help='metric to use for early stopping (default: %(default)s)')
+    parser.add_argument('--from_scratch', action='store_true',
+                        help='whether to train a new model every co-training iteration (default: False)')
     # TODO add additional arguments
     
     return parser
