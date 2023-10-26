@@ -26,8 +26,9 @@ import pickle
 import copy
 import random
 from math import floor
+import gc
 
-from utils import add_to_imagefolder, train_test_split_samples
+from utils import *
 
 # takes in a Tensor of shape e.g. (# instances, # prob outputs) and returns a tuple
 # (Tensor[top probabilities], Tensor[predicted labels], Tensor[instance indexes])
@@ -235,6 +236,33 @@ def test(args, rank, world_size, loader, model, device):
 
     return test_acc, test_loss
 
+def c_test(args, rank, world_size, loader0, loader1, model0, model1, device):
+    loss_fn = torch.nn.CrossEntropyLoss()
+    ddp_loss = torch.zeros(3).to(device)
+    model0.eval()
+    model1.eval()
+    with torch.no_grad():
+        for batch, ((X0, y0), (X1, y1))  in enumerate(zip(iter(loader0), iter(loader1))):
+            X0, y0 = X0.to(device), y0.to(device)
+            X1, y1 = X1.to(device), y1.to(device)
+
+            output = torch.nn.Softmax(-1)(model0(X0)) * torch.nn.Softmax(-1)(model1(X1))
+
+            ddp_loss[1] += (output.argmax(1) == y1).type(torch.float).sum().item()
+            ddp_loss[2] += len(X)
+    
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+
+    test_acc = ddp_loss[1] / ddp_loss[2] 
+    test_loss = ddp_loss[0] / ddp_loss[2]
+
+    if rank == 0:
+        print('Test error: \tAccuracy: {:.2f}% \tAverage loss: {:.6f}'
+              .format(100*test_acc, test_loss))
+
+    return test_acc
+
+
 
 def create_imagefolder(data, samples, path, transform, new_path=None):
     imgfolder = datasets.ImageFolder(path, transform=transform)
@@ -247,7 +275,9 @@ def create_imagefolder(data, samples, path, transform, new_path=None):
 
     return imgfolder
 
+  
 def create_sampler_loader(args, rank, world_size, data, batch_size, cuda_kwargs, shuffle=True):
+
     sampler = DistributedSampler(data, rank=rank, num_replicas=world_size, shuffle=shuffle)
 
     loader_kwargs = {'batch_size': batch_size, 'sampler': sampler}
@@ -442,7 +472,44 @@ def training_process(args, rank, world_size):
     sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, args.test_batch_size, cuda_kwargs)
 
     k = floor(len(data_unlbl0) * args.k)
-    for c_iter in range(1, args.cotrain_iters + 1):        
+    
+    for c_iter in range(1, args.cotrain_iters + 1):
+        if args.from_scratch and c_iter > 1:
+            # instantiate models, send to device 
+            #del model0
+            #del model1
+            model0, model1 = resnet50(num_classes=3).to(device), resnet50(num_classes=3).to(device)
+            
+            # wrapping to take advantage of FSDP
+            model0 = FSDP(model0, 
+                        auto_wrap_policy=auto_wrap_policy,
+                        mixed_precision=torch.distributed.fsdp.MixedPrecision(
+                            param_dtype=torch.float16, 
+                            reduce_dtype=torch.float32, 
+                            buffer_dtype=torch.float32, 
+                            cast_forward_inputs=True)
+                            )
+
+            model1 = FSDP(model1, 
+                        auto_wrap_policy=auto_wrap_policy,
+                        mixed_precision=torch.distributed.fsdp.MixedPrecision(
+                            param_dtype=torch.float16, 
+                            reduce_dtype=torch.float32, 
+                            buffer_dtype=torch.float32, 
+                            cast_forward_inputs=True)
+                            )
+
+            optimizer0 = optim.SGD(model0.parameters(), lr=args.learning_rate, momentum=args.momentum)
+            optimizer1 = optim.SGD(model1.parameters(), lr=args.learning_rate, momentum=args.momentum)
+            
+            scheduler0 = ReduceLROnPlateau(optimizer0)
+            scheduler1 = ReduceLROnPlateau(optimizer1)
+
+        best_vloss0, best_vloss1 = float("inf"), float("inf")
+        best_val_acc0, best_val_acc1 = 0, 0
+        epochs_since_improvement0 = 0
+        epochs_since_improvement1 = 0
+
         # if there's no more unlabeled examples for co-training, stop the process
         if len(loader_unlbl0.dataset) == 0 and len(loader_unlbl1.dataset) == 0: 
             break
@@ -450,11 +517,8 @@ def training_process(args, rank, world_size):
         if rank == 0:
             wandb.init(project='Co-Training', entity='ai2es',
             name=f"{rank}: Co-Training - {c_iter}",
-            config={'args': vars(args)})
+            config={'args': vars(args), 'c_iter': c_iter})
             print(f"Co-Training Iteration: {c_iter}\n---------------------------------------")
-
-#        if args.from_scratch and c_iter > 1:
-#            model0, model1, optimizer0, optimizer1, scheduler0, scheduler1 = create_models(args, auto_wrap_policy, device)
 
         stopper0 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
         stopper1 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
@@ -472,11 +536,24 @@ def training_process(args, rank, world_size):
         # load the best states
         model0.load_state_dict(states['model0_state'])
         model1.load_state_dict(states['model1_state'])
+
+        val_acc0, val_acc1, c_acc = c_test(args, rank, world_size, loader_val0, loader_val1, model0, model1, device)
         
         cotrain(args, rank, world_size,
                 loader_train0, loader_train1, 
                 loader_unlbl0, loader_unlbl1, 
                 model0, model1, k,device)
+
+        test_acc0, test_loss0 = test(args, rank, world_size, loader_test0, model0, device)
+        test_acc1, test_loss1 = test(args, rank, world_size, loader_test1, model1, device)
+
+        if rank == 0:
+            wandb.log({'test_acc0': test_acc0,
+                       'test_loss0': test_loss0,
+                       'test_acc1' : test_acc1,
+                       'test_loss1': test_loss1,
+                       'c_acc': c_acc},
+                       step=None)
 
         if rank == 0:
             wandb.finish()
@@ -510,7 +587,7 @@ def main(args, rank, world_size):
     states, metrics = training_process(args, rank, world_size)
 
     if rank == 0:
-        torch.save(states, '/home/scratch/tiffanyle/cotraining/states.pth')
+        torch.save(states, '/scratch/tiffanyle/cotraining/states.pth')
 
     cleanup()
         
@@ -540,7 +617,7 @@ def create_parser():
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
-    # TODO add additional arguments
+
     
     return parser
 
