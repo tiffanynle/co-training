@@ -28,7 +28,7 @@ import random
 from math import floor
 import gc
 
-from utils import add_to_imagefolder, train_test_split_samples
+from utils import *
 
 # takes in a Tensor of shape e.g. (# instances, # prob outputs) and returns a tuple
 # (Tensor[top probabilities], Tensor[predicted labels], Tensor[instance indexes])
@@ -239,6 +239,34 @@ def test(args, rank, world_size, loader, model, device):
 
     return test_acc, test_loss
 
+
+def c_test(args, rank, world_size, loader0, loader1, model0, model1, device):
+    loss_fn = torch.nn.CrossEntropyLoss()
+    ddp_loss = torch.zeros(3).to(device)
+    model0.eval()
+    model1.eval()
+    with torch.no_grad():
+        for batch, ((X0, y0), (X1, y1))  in enumerate(zip(iter(loader0), iter(loader1))):
+            X0, y0 = X0.to(device), y0.to(device)
+            X1, y1 = X1.to(device), y1.to(device)
+
+            output = torch.nn.Softmax(-1)(model0(X0)) * torch.nn.Softmax(-1)(model1(X1))
+
+            ddp_loss[1] += (output.argmax(1) == y1).type(torch.float).sum().item()
+            ddp_loss[2] += len(X)
+    
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+
+    test_acc = ddp_loss[1] / ddp_loss[2] 
+    test_loss = ddp_loss[0] / ddp_loss[2]
+
+    if rank == 0:
+        print('Test error: \tAccuracy: {:.2f}% \tAverage loss: {:.6f}'
+              .format(100*test_acc, test_loss))
+
+    return test_acc
+
+
 def create_imagefolder(data, samples, path, transform, new_path=None):
     imgfolder = datasets.ImageFolder(path, transform=transform)
     imgfolder.class_to_idx = data['class_map']
@@ -249,6 +277,7 @@ def create_imagefolder(data, samples, path, transform, new_path=None):
         imgfolder.root = new_path
 
     return imgfolder
+
 
 def create_sampler_loader(args, rank, world_size, data, cuda_kwargs, shuffle=True):
     sampler = DistributedSampler(data, rank=rank, num_replicas=world_size, shuffle=shuffle)
@@ -415,7 +444,7 @@ def training_process(args, rank, world_size):
         for epoch in range(1, args.epochs + 1):
             gc.collect()
             train(args, rank, world_size, loader_train0, model0, optimizer0, epoch, device, sampler_train0)
-            val_acc0, vloss0 = test(args, rank, world_size, loader_val0, model0, device)
+            val_acc0, val_loss0 = test(args, rank, world_size, loader_val0, model0, device)
 
             if stopper0.is_new_best_metric(val_acc0, val_loss0):
                 states['model0_state'] = model0.state_dict()
@@ -423,22 +452,19 @@ def training_process(args, rank, world_size):
             
             if rank == 0:
                 wandb.log({'val_acc0': val_acc0,
-                          'vloss0': vloss0,
+                          'vloss0': val_loss0,
                           'best_vloss0': best_vloss0,
                           'best_vacc0': best_val_acc0},
                           step=epoch)
-                
-            if epochs_since_improvement0 > args.patience: 
-                break
 
             if stopper0.early_stop():
                 break
 
-            scheduler0.step(vloss0)
+            scheduler0.step(val_loss0)
         
         for epoch in range(1, args.epochs + 1):
             train(args, rank, world_size, loader_train1, model1, optimizer1, epoch, device, sampler_train1)
-            val_acc1, vloss1 = test(args, rank, world_size, loader_val1, model1, device)
+            val_acc1, val_loss1 = test(args, rank, world_size, loader_val1, model1, device)
 
             if stopper1.is_new_best_metric(val_acc1, val_loss1):
                 states['model1_state'] = model1.state_dict()
@@ -446,22 +472,21 @@ def training_process(args, rank, world_size):
             
             if rank == 0:
                 wandb.log({'val_acc1': val_acc1,
-                          'vloss1': vloss1,
+                          'vloss1': val_loss1,
                           'best_vloss1': best_vloss1,
                           'best_vacc1': best_val_acc1},
                           step=epoch + args.epochs)
 
             if stopper1.early_stop():
                 break
-                
-            if epochs_since_improvement1 > args.patience: 
-                break
-
-            scheduler1.step(vloss1)
+            
+            scheduler1.step(val_loss1)
 
         # load the best states
         model0.load_state_dict(states['model0_state'])
         model1.load_state_dict(states['model1_state'])
+
+        val_acc0, val_acc1, c_acc = c_test(args, rank, world_size, loader_val0, loader_val1, model0, model1, device)
         
         cotrain(args, rank, world_size,
                 loader_train0, loader_train1, 
@@ -475,7 +500,8 @@ def training_process(args, rank, world_size):
             wandb.log({'test_acc0': test_acc0,
                        'test_loss0': test_loss0,
                        'test_acc1' : test_acc1,
-                       'test_loss1': test_loss1},
+                       'test_loss1': test_loss1,
+                       'c_acc': c_acc},
                        step=None)
 
         if rank == 0:
@@ -517,17 +543,17 @@ def main(args, rank, world_size):
 def create_parser():
     parser = argparse.ArgumentParser(description='co-training')
     
-    parser.add_argument('-e', '--epochs', type=int, default=100, 
+    parser.add_argument('-e', '--epochs', type=int, default=1, 
                         help='training epochs (default: 10)')
     parser.add_argument('-b', '--batch_size', type=int, default=256, 
                         help='batch size for training (default: 64)')
     parser.add_argument('-tb', '--test_batch_size', type=int, default=256, 
                         help='test batch size for training (default: 64)')
-    parser.add_argument('-lr', '--learning_rate', type=float, default=0.1,
+    parser.add_argument('-lr', '--learning_rate', type=float, default=1e-3,
                         help='learning rate for SGD (default 1e-3)')
     parser.add_argument('-m', '--momentum', type=float, default=0.9,
                         help='momentum for SGD (default 0.9')
-    parser.add_argument('-p', '--patience', type=float, default=32,
+    parser.add_argument('-p', '--patience', type=float, default=50,
                         help='number of epochs to train for without improvement (default: 10)')
     parser.add_argument('--cotrain_iters', type=int, default=10,
                         help='max number of iterations for co-training (default: 25)')
