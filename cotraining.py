@@ -249,7 +249,7 @@ def c_test(args, rank, world_size, loader0, loader1, model0, model1, device):
             output = torch.nn.Softmax(-1)(model0(X0)) * torch.nn.Softmax(-1)(model1(X1))
 
             ddp_loss[1] += (output.argmax(1) == y1).type(torch.float).sum().item()
-            ddp_loss[2] += len(X)
+            ddp_loss[2] += len(X0)
     
     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
 
@@ -537,7 +537,8 @@ def training_process(args, rank, world_size):
         model0.load_state_dict(states['model0_state'])
         model1.load_state_dict(states['model1_state'])
 
-        val_acc0, val_acc1, c_acc = c_test(args, rank, world_size, loader_val0, loader_val1, model0, model1, device)
+        c_acc_val = c_test(args, rank, world_size, loader_val0, loader_val1, model0, model1, device)
+        c_acc_test = c_test(args, rank, world_size, loader_test0, loader_test1, model0, model1, device)
         
         cotrain(args, rank, world_size,
                 loader_train0, loader_train1, 
@@ -552,9 +553,9 @@ def training_process(args, rank, world_size):
                        'test_loss0': test_loss0,
                        'test_acc1' : test_acc1,
                        'test_loss1': test_loss1,
-                       'c_acc': c_acc},
+                       'c_acc_val': c_acc_val,
+                       'c_acc_test': c_acc_test},
                        step=None)
-
         if rank == 0:
             wandb.finish()
 
