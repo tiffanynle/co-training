@@ -29,6 +29,8 @@ from math import floor
 import gc
 
 from utils import *
+from DAHS.DAHB import DistributedAsynchronousGridSearch
+from DAHS.torch_utils import *
 
 # takes in a Tensor of shape e.g. (# instances, # prob outputs) and returns a tuple
 # (Tensor[top probabilities], Tensor[predicted labels], Tensor[instance indexes])
@@ -584,11 +586,21 @@ def cleanup():
 def main(args, rank, world_size):
 
     setup(rank, world_size)
+    
+    search_space = ['k']
+
+    agent = sync_parameters(args, rank, search_space, DistributedAsynchronousGridSearch)
+
+    args = agent.to_namespace(agent.combination)
 
     states, metrics = training_process(args, rank, world_size)
 
     if rank == 0:
-        torch.save(states, '/scratch/tiffanyle/cotraining/states.pth')
+        print('saving checkpoint')
+        agent.save_checkpoint(states)
+
+    print('finishing combination')
+    agent.finish_combination(float(metric))
 
     cleanup()
         
@@ -609,15 +621,17 @@ def create_parser():
                         help='number of epochs to train for without improvement (default: 32)')
     parser.add_argument('--cotrain_iters', type=int, default=100,
                         help='max number of iterations for co-training (default: 100)')
-    parser.add_argument('--k', type=float, default=0.025,
+    parser.add_argument('--k', type=float, default=[0.025, 0.05, 0.1],
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.025)')
-    parser.add_argument('--percent_unlabeled', type=float, default=0.75,
+    parser.add_argument('--percent_unlabeled', type=float, default=0.9,
                         help='percentage of unlabeled samples to start with (default: 0.75)')
     parser.add_argument('--stopping_metric', type=str, default='accuracy', choices=['loss', 'accuracy'],
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/k',
+                        help='path for hparam search directory')
 
     
     return parser
