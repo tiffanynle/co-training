@@ -60,7 +60,7 @@ class EarlyStopper:
         self.best_val_acc = 0
 
     # TODO perhaps there is a more elegant way to write this
-    def is_new_best_metric(self, val_acc, val_loss):
+    def update_new_best_metric(self, val_acc, val_loss):
         self.epochs_since_improvement += 1
         if self.stopping_metric == 'loss' and val_loss < self.best_val_loss - 1e-3:
             self.best_val_loss = val_loss

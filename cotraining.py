@@ -238,6 +238,7 @@ def test(args, rank, world_size, loader, model, device):
 
     return test_acc, test_loss
 
+
 def c_test(args, rank, world_size, loader0, loader1, model0, model1, device):
     loss_fn = torch.nn.CrossEntropyLoss()
     ddp_loss = torch.zeros(3).to(device)
@@ -265,7 +266,6 @@ def c_test(args, rank, world_size, loader0, loader1, model0, model1, device):
     return test_acc
 
 
-
 def create_imagefolder(data, samples, path, transform, new_path=None):
     imgfolder = datasets.ImageFolder(path, transform=transform)
     imgfolder.class_to_idx = data['class_map']
@@ -288,35 +288,6 @@ def create_sampler_loader(args, rank, world_size, data, batch_size, cuda_kwargs,
     loader = DataLoader(data, **loader_kwargs)
 
     return sampler, loader
-
-class EarlyStopper:
-    def __init__(self, stopping_metric, patience):
-        self.stopping_metric = stopping_metric
-        self.patience = patience
-        self.epochs_since_improvement = 0
-
-        self.best_val_loss = float("inf")
-        self.best_val_acc = 0
-
-    # TODO surely there is a nicer way to write this
-    def update_new_best_metric(self, val_acc, val_loss):
-        self.epochs_since_improvement += 1
-        if self.stopping_metric == 'loss' and val_loss < self.best_val_loss - 1e-3:
-            self.best_val_loss = val_loss
-            self.best_val_acc = val_acc
-            self.epochs_since_improvement = 0
-            return True
-        elif self.stopping_metric == 'accuracy' and val_acc > self.best_val_acc + 1e-3:
-            self.best_val_loss = val_loss
-            self.best_val_acc = val_acc
-            self.epochs_since_improvement = 0
-            return True
-        return False
-    
-    def early_stop(self):
-        if self.epochs_since_improvement > self.patience: 
-            return True
-        return False
 
 # TODO clean this
 def train_wrapper(args, rank, world_size, 
@@ -389,6 +360,7 @@ def create_models(args, auto_wrap_policy, device):
     scheduler1 = ReduceLROnPlateau(optimizer1)
 
     return model0, model1, optimizer0, optimizer1, scheduler0, scheduler1
+
 
 def training_process(args, rank, world_size):
     random.seed(13)
@@ -474,47 +446,15 @@ def training_process(args, rank, world_size):
     sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, args.test_batch_size, cuda_kwargs)
 
     k = floor(len(data_unlbl0) * args.k)
-    
+    best_test_acc = 0.0
     for c_iter in range(1, args.cotrain_iters + 1):
-        if args.from_scratch and c_iter > 1:
-            # instantiate models, send to device 
-            #del model0
-            #del model1
-            model0, model1 = resnet50(num_classes=3).to(device), resnet50(num_classes=3).to(device)
-            
-            # wrapping to take advantage of FSDP
-            model0 = FSDP(model0, 
-                        auto_wrap_policy=auto_wrap_policy,
-                        mixed_precision=torch.distributed.fsdp.MixedPrecision(
-                            param_dtype=torch.float16, 
-                            reduce_dtype=torch.float32, 
-                            buffer_dtype=torch.float32, 
-                            cast_forward_inputs=True)
-                            )
-
-            model1 = FSDP(model1, 
-                        auto_wrap_policy=auto_wrap_policy,
-                        mixed_precision=torch.distributed.fsdp.MixedPrecision(
-                            param_dtype=torch.float16, 
-                            reduce_dtype=torch.float32, 
-                            buffer_dtype=torch.float32, 
-                            cast_forward_inputs=True)
-                            )
-
-            optimizer0 = optim.SGD(model0.parameters(), lr=args.learning_rate, momentum=args.momentum)
-            optimizer1 = optim.SGD(model1.parameters(), lr=args.learning_rate, momentum=args.momentum)
-            
-            scheduler0 = ReduceLROnPlateau(optimizer0)
-            scheduler1 = ReduceLROnPlateau(optimizer1)
-
-        best_vloss0, best_vloss1 = float("inf"), float("inf")
-        best_val_acc0, best_val_acc1 = 0, 0
-        epochs_since_improvement0 = 0
-        epochs_since_improvement1 = 0
-
         # if there's no more unlabeled examples for co-training, stop the process
         if len(loader_unlbl0.dataset) == 0 and len(loader_unlbl1.dataset) == 0: 
             break
+
+        if args.from_scratch and c_iter > 1:
+            # instantiate models, send to device 
+            model0, model1, optimizer0, optimizer1, scheduler0, scheduler1 = create_models(args, auto_wrap_policy, device)
 
         if rank == 0:
             wandb.init(project='Co-Training', entity='ai2es',
@@ -550,6 +490,8 @@ def training_process(args, rank, world_size):
         test_acc0, test_loss0 = test(args, rank, world_size, loader_test0, model0, device)
         test_acc1, test_loss1 = test(args, rank, world_size, loader_test1, model1, device)
 
+        best_test_acc = max(best_test_acc, test_acc0, test_acc1)
+
         if rank == 0:
             wandb.log({'test_acc0': test_acc0,
                        'test_loss0': test_loss0,
@@ -574,14 +516,16 @@ def training_process(args, rank, world_size):
 
     dist.barrier()
 
-    # TODO return states, best metric
-    return states, None
+    return states, best_test_acc
+
 
 def setup(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
+
 def cleanup():
     dist.destroy_process_group()
+
 
 def main(args, rank, world_size):
 
@@ -593,7 +537,7 @@ def main(args, rank, world_size):
 
     args = agent.to_namespace(agent.combination)
 
-    states, metrics = training_process(args, rank, world_size)
+    states, metric = training_process(args, rank, world_size)
 
     if rank == 0:
         print('saving checkpoint')
@@ -603,7 +547,8 @@ def main(args, rank, world_size):
     agent.finish_combination(float(metric))
 
     cleanup()
-        
+
+
 def create_parser():
     parser = argparse.ArgumentParser(description='co-training')
     
@@ -625,16 +570,15 @@ def create_parser():
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.025)')
     parser.add_argument('--percent_unlabeled', type=float, default=0.9,
-                        help='percentage of unlabeled samples to start with (default: 0.75)')
+                        help='percentage of unlabeled samples to start with (default: 0.9)')
     parser.add_argument('--stopping_metric', type=str, default='accuracy', choices=['loss', 'accuracy'],
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
-    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/k',
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/tiffanyle/co-training_hparams/k',
                         help='path for hparam search directory')
-
-    
     return parser
+
 
 if __name__ == '__main__':
     parser = create_parser()
