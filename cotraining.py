@@ -57,8 +57,8 @@ def remove_collisions(lbl_model0, idx_model0, lbl_model1, idx_model1):
                                         idx_model1_np,
                                         return_indices=True)
 
-    print('Intersection: {} \nidx_inter0: {} \nidx_inter1: {}'
-          .format(inter, idx_inter0, idx_inter1))
+    # print('Intersection: {} \nidx_inter0: {} \nidx_inter1: {}'
+    #       .format(inter, idx_inter0, idx_inter1))
 
     # which instances have a conflicting prediction from both models?
     mask_coll = lbl_model0_np[idx_inter0] != lbl_model1_np[idx_inter1]
@@ -66,7 +66,8 @@ def remove_collisions(lbl_model0, idx_model0, lbl_model1, idx_model1):
 
     # TODO may also want to return the predicted labels for the collisions
     if (len(idx_colls) > 0):
-        print(f"idx_cols: {idx_colls}")
+        print(f"Number of collisions: {len(idx_colls)}")
+        # print(f"idx_cols: {idx_colls}")
         idx_coll0 = idx_inter0[mask_coll]
         idx_coll1 = idx_inter1[mask_coll]
         
@@ -151,10 +152,10 @@ def cotrain(args, rank, world_size,
     samples_unlbl0 = np.stack([np.array(a) for a in loader_unlbl0.dataset.samples])
     samples_unlbl1 = np.stack([np.array(a) for a in loader_unlbl1.dataset.samples])
 
-    if len(idx_colls) > 0:
-        print("\nImage paths of collisions:\n unlbl0:\n {}\n unlbl1:\n {}\n"
-             .format(samples_unlbl0[idx_colls],
-                     samples_unlbl1[idx_colls]))
+    # if len(idx_colls) > 0:
+    #     print("\nImage paths of collisions:\n unlbl0:\n {}\n unlbl1:\n {}\n"
+    #          .format(samples_unlbl0[idx_colls],
+    #                  samples_unlbl1[idx_colls]))
 
     # retrieve the instances that have been labeled with high confidence by the other model
     list_samples0 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl0[idx_topk1])]
@@ -368,19 +369,21 @@ def training_process(args, rank, world_size):
     with open('cotraining_samples_lists_fixed.pkl', 'rb') as fp:
         data = pickle.load(fp)
 
+    # split data first into not-test / test 
+    samples_unlbl0, samples_test0, samples_unlbl1, samples_test1 = \
+        train_test_split_samples(data['labeled'], data['inferred'],
+                                 test_size=args.percent_test, random_state=13)
+
     # split data into labeled/unlabeled
     samples_train0, samples_unlbl0, samples_train1, samples_unlbl1 = \
-        train_test_split_samples(data['labeled'], data['inferred'],
-                                test_size=args.percent_unlabeled, random_state=13)
-        
-    # split the data so we get 70/10/20 train/val/test
-    samples_train0, samples_test0, samples_train1, samples_test1 = \
-        train_test_split_samples(samples_train0, samples_train1,
-                                 test_size=0.2, random_state=13)
+        train_test_split_samples(samples_unlbl0, samples_unlbl1,
+                             test_size=args.percent_unlabeled, random_state=13)
 
+    # split train data into train/validation
     samples_train0, samples_val0, samples_train1, samples_val1 = \
         train_test_split_samples(samples_train0, samples_train1,
-                                 test_size=0.125, random_state=13)
+                                test_size=args.percent_val, random_state=13)
+
     if rank == 0:
         print("Length of datasets:\n Train: {} \tUnlabeled: {} \tVal: {} \tTest: {}"
             .format(len(samples_train0), len(samples_unlbl0),
@@ -418,7 +421,7 @@ def training_process(args, rank, world_size):
 
     model0, model1, optimizer0, optimizer1, scheduler0, scheduler1 = create_models(args, auto_wrap_policy, device)
 
-    cuda_kwargs = {'num_workers': 12, 'pin_memory': True, 'shuffle': False}
+    cuda_kwargs = {'num_workers': 4, 'pin_memory': True, 'shuffle': False}
 
     states = {
         'model0_state': model0.state_dict(), 
@@ -446,7 +449,8 @@ def training_process(args, rank, world_size):
     sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1, args.test_batch_size, cuda_kwargs)
 
     k = floor(len(data_unlbl0) * args.k)
-    best_test_acc = 0.0
+    best_val_acc = 0.0
+    best_val_loss = float("inf")
     for c_iter in range(1, args.cotrain_iters + 1):
         # if there's no more unlabeled examples for co-training, stop the process
         if len(loader_unlbl0.dataset) == 0 and len(loader_unlbl1.dataset) == 0: 
@@ -460,16 +464,18 @@ def training_process(args, rank, world_size):
             wandb.init(project='Co-Training', entity='ai2es',
             name=f"{rank}: Co-Training - {c_iter}",
             config={'args': vars(args), 'c_iter': c_iter})
-            print(f"Co-Training Iteration: {c_iter}\n---------------------------------------")
+            print(f"Co-Training Iteration: {c_iter}\n---------------------------------------------------------------")
 
         stopper0 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
         stopper1 = EarlyStopper(stopping_metric=args.stopping_metric, patience=args.patience)
 
+        print("training model0 ...")
         train_wrapper(args, rank, world_size, 
                       loader_train0, loader_val0, loader_test0, sampler_train0,
                       model0, optimizer0, scheduler0, stopper0,
                       states, states_keys0, log_keys0, device)
 
+        print("training model1 ...")
         train_wrapper(args, rank, world_size, 
                       loader_train1, loader_val1, loader_test1, sampler_train1,
                       model1, optimizer1, scheduler1, stopper1,
@@ -490,7 +496,8 @@ def training_process(args, rank, world_size):
         test_acc0, test_loss0 = test(args, rank, world_size, loader_test0, model0, device)
         test_acc1, test_loss1 = test(args, rank, world_size, loader_test1, model1, device)
 
-        best_test_acc = max(best_test_acc, test_acc0, test_acc1)
+        best_val_acc = max(best_val_acc, stopper0.best_val_acc, stopper1.best_val_acc)
+        best_val_loss = min(best_val_loss, stopper0.best_val_loss, stopper1.best_val_loss)
 
         if rank == 0:
             wandb.log({'test_acc0': test_acc0,
@@ -500,6 +507,7 @@ def training_process(args, rank, world_size):
                        'c_acc_val': c_acc_val,
                        'c_acc_test': c_acc_test},
                        step=None)
+
         if rank == 0:
             wandb.finish()
 
@@ -516,7 +524,7 @@ def training_process(args, rank, world_size):
 
     dist.barrier()
 
-    return states, best_test_acc
+    return states, best_val_acc
 
 
 def setup(rank, world_size):
@@ -553,29 +561,33 @@ def create_parser():
     parser = argparse.ArgumentParser(description='co-training')
     
     parser.add_argument('-e', '--epochs', type=int, default=100, 
-                        help='training epochs (default: 100)')
+                        help='training epochs (default: %(default)s)')
     parser.add_argument('-b', '--batch_size', type=int, default=64, 
-                        help='batch size for training (default: 64)')
+                        help='batch size for training (default: %(default)s)')
     parser.add_argument('-tb', '--test_batch_size', type=int, default=64, 
-                        help=' batch size for testing (default: 64)')
+                        help=' batch size for testing (default: %(default)s)')
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-3,
-                        help='learning rate for SGD (default: 1e-3)')
+                        help='learning rate for SGD (default: %(default)s)')
     parser.add_argument('-m', '--momentum', type=float, default=0.9,
-                        help='momentum for SGD (default: 0.9')
+                        help='momentum for SGD (default: %(default)s')
     parser.add_argument('-p', '--patience', type=float, default=32,
-                        help='number of epochs to train for without improvement (default: 32)')
+                        help='number of epochs to train for without improvement (default: %(default)s)')
     parser.add_argument('--cotrain_iters', type=int, default=100,
-                        help='max number of iterations for co-training (default: 100)')
+                        help='max number of iterations for co-training (default: %(default)s)')
     parser.add_argument('--k', type=float, default=[0.025, 0.05, 0.1],
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.025)')
     parser.add_argument('--percent_unlabeled', type=float, default=0.9,
-                        help='percentage of unlabeled samples to start with (default: 0.9)')
+                        help='percentage of unlabeled samples to start with (default: %(default)s)')
+    parser.add_argument('--percent_test', type=float, default=0.2,
+                        help='percentage of samples to use for testing (default: %(default)s)')
+    parser.add_argument('--percent_val', type=float, default=0.2,
+                        help='percentage of labeled samples to use for validation (default: %(default)s)')
     parser.add_argument('--stopping_metric', type=str, default='accuracy', choices=['loss', 'accuracy'],
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
-    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/tiffanyle/co-training_hparams/k',
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/tiffanyle/co-training_hparams/k_80_fs',
                         help='path for hparam search directory')
     return parser
 
