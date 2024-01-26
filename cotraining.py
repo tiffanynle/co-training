@@ -225,7 +225,7 @@ def training_process(args, rank, world_size):
             break
         if args.from_scratch and c_iter > 1:
             model0 = create_model(auto_wrap_policy, device, num_classes)
-            model1 = create_model(auto_wrap_policy, num_classes)
+            model1 = create_model(auto_wrap_policy, device, num_classes)
             models = [model0, model1]
         
         print(f"co-training iteration: {c_iter}")
