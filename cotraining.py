@@ -43,7 +43,8 @@ def create_model(auto_wrap_policy, device, num_classes):
                      param_dtype=torch.float16, 
                      reduce_dtype=torch.float32, 
                      buffer_dtype=torch.float32, 
-                     cast_forward_inputs=True))
+                     cast_forward_inputs=True)
+                )
 
     return model
 
