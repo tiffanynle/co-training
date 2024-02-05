@@ -39,11 +39,6 @@ def create_model(auto_wrap_policy, device, num_classes):
     
     model = FSDP(model, 
                  auto_wrap_policy=auto_wrap_policy,
-                 mixed_precision=torch.distributed.fsdp.MixedPrecision(
-                     param_dtype=torch.float16, 
-                     reduce_dtype=torch.float32, 
-                     buffer_dtype=torch.float32, 
-                     cast_forward_inputs=True)
                 )
 
     return model
@@ -69,78 +64,10 @@ def c_test(rank, model0, model1, loader0, loader1, device):
     test_loss = ddp_loss[0] / ddp_loss[2]
 
     if rank == 0:
-        print('Test error: \tAccuracy: {:.2f}% \tAverage loss: {:.6f}'
-              .format(100*test_acc, test_loss))
+        print('Test error: \tCo-Accuracy: {:.2f}%'
+              .format(100*test_acc))
 
-    return test_acc, test_loss
-
-def cotraining_update(args, rank, world_size,
-                      data_train0, data_train1,
-                      data_unlbl0, data_unlbl1,
-                      model0, model1, k, device):
-    num_classes = len(data_train0.classes)
-
-    sampler_unlbl0, loader_unlbl0 = create_sampler_loader(args, rank, world_size, data_unlbl0)
-    sampler_unlbl1, loader_unlbl1 = create_sampler_loader(args, rank, world_size, data_unlbl1)
-
-    pred_model0 = predict(world_size, args.batch_size, 
-                          loader_unlbl0, model0, num_classes, device)[:len(data_unlbl0)]
-    pred_model1 = predict(world_size, args.batch_size, 
-                          loader_unlbl1, model1, num_classes, device)[:len(data_unlbl0)]
-    
-    # this may be superfluous, but I want to make sure we agree.
-    dist.broadcast(pred_model0, 0)
-    dist.broadcast(pred_model1, 0)
-
-    print("Number of unlabeled instances view0: {} view1: {}"
-          .format(len(loader_unlbl0.dataset), len(loader_unlbl1.dataset)))
-    
-    _, lbl_topk0, idx_topk0 = get_topk_predictions(
-                                    pred_model0,
-                                    k if k <= len(pred_model0) 
-                                    else len(pred_model0))
-    _, lbl_topk1, idx_topk1 = get_topk_predictions(
-                                    pred_model1, 
-                                    k if k <= len(pred_model1) 
-                                    else len(pred_model1))
-
-
-    # if two models predict confidently on the same instance,
-    # find and remove conflicting predictions from the lists
-    lbl_topk0, idx_topk0, lbl_topk1, idx_topk1, idx_colls = \
-    remove_collisions(lbl_topk0, idx_topk0, lbl_topk1, idx_topk1)
-
-    samples_unlbl0 = np.stack([np.array(a) for a in loader_unlbl0.dataset.samples])
-    samples_unlbl1 = np.stack([np.array(a) for a in loader_unlbl1.dataset.samples])
-
-    # retrieve the instances that have been labeled with high confidence by the other model
-    list_samples0 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl0[idx_topk1])]
-    list_samples1 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl1[idx_topk0])]
-
-    # image paths for both
-    paths0 = [i for i, _ in list_samples0]
-    paths1 = [i for i, _ in list_samples1]
-
-    data_train0.samples = list(zip(paths0, lbl_topk1.tolist()))
-    data_train1.samples = list(zip(paths1, lbl_topk0.tolist()))
-
-    # remove instances from unlabeled dataset
-    mask = np.ones(len(loader_unlbl0.dataset), dtype=bool)
-    mask[idx_topk0] = False
-    mask[idx_topk1] = False
-
-    print(f"Number of unlabeled instances to remove: {(~mask).sum()}")
-
-    samples_unlbl0 = samples_unlbl0[mask]
-    samples_unlbl1 = samples_unlbl1[mask]
-
-    list_unlbl0 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl0)]
-    list_unlbl1 = [(str(a[0]), int(a[1])) for a in list(samples_unlbl1)]
-
-    loader_unlbl0.dataset.samples = list_unlbl0
-    loader_unlbl1.dataset.samples = list_unlbl1
-
-    print(f"Remaining number of unlabeled instances: {len(loader_unlbl0.dataset)}")
+    return test_acc
 
 
 def training_process(args, rank, world_size):
@@ -171,10 +98,10 @@ def training_process(args, rank, world_size):
 
     # ResNet50 wants 224x224 images
     trans = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                          std=[0.229, 0.224, 0.225])
     ])
 
@@ -192,7 +119,8 @@ def training_process(args, rank, world_size):
     data_val1 = create_imagefolder(data, samples_val1, dummy_path, trans, new_path)
     data_test1 = create_imagefolder(data, samples_test1, dummy_path, trans, new_path)
 
-    num_classes = len(data_train0.classes)
+    num_classes = 3
+    num_views = 2
 
     auto_wrap_policy = functools.partial(
         size_based_auto_wrap_policy, min_num_params=1_000_000)
@@ -200,69 +128,89 @@ def training_process(args, rank, world_size):
     device = torch.device(rank % torch.cuda.device_count())
     torch.cuda.set_device(device)
 
-    model0 = create_model(auto_wrap_policy, device, num_classes)
-    model1 = create_model(auto_wrap_policy, device, num_classes)
-    models = [model0, model1]
+    models = [create_model(auto_wrap_policy, device, num_classes) 
+                for _ in range(num_views)]
 
-    sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0)
-    sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0)
+    states = {'model0_state': models[0].state_dict(),
+              'model1_state': models[1].state_dict()}
 
-    sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1)
-    sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1)
+    ct_model = CoTrainingModel(rank, world_size, models)
 
-    if rank == 0:
-        wandb.init(project='OO-CT-tests',
-                    entity='ai2es',
-                    name=f'Co-Training Test Run... 2!!!')
+    sampler_val0, loader_val0 = create_sampler_loader(rank, world_size, data_val0, args.batch_size)
+    sampler_test0, loader_test0 = create_sampler_loader(rank, world_size, data_test0, args.batch_size)
+
+    sampler_val1, loader_val1 = create_sampler_loader(rank, world_size, data_val1, args.batch_size)
+    sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.batch_size)
+
+    # if rank == 0:
+    #     wandb.init(project='Co-Training v0',
+    #                 entity='ai2es',
+    #                 name=f'Co-Training',
+    #                 config={'args': vars(args)})
 
     loss_fn = nn.CrossEntropyLoss()
 
     k = floor(len(data_unlbl0) * args.k)
+    if rank == 0:
+        print(f"k: {k}")
+
     best_val_acc = 0.0
-    best_states = dict()
+    best_val_loss = float('inf')
     c_iter_logs = []
     for c_iter in range(args.cotrain_iters):
         if len(data_unlbl0) == 0 and len(data_unlbl1) == 0:
             break
-        if args.from_scratch and c_iter > 1:
-            model0 = create_model(auto_wrap_policy, device, num_classes)
-            model1 = create_model(auto_wrap_policy, device, num_classes)
-            models = [model0, model1]
-        
-        print(f"co-training iteration: {c_iter}")
+        if args.from_scratch and c_iter > 0:
+            models = [create_model(auto_wrap_policy, device, num_classes) 
+                        for _ in range(num_views)]
+            gc.collect()
+            ct_model = CoTrainingModel(rank, world_size, models)
+
+        if rank == 0:
+            print(f"co-training iteration: {c_iter}")
+            print("train: {} unlabeled: {}"
+                  .format(len(data_train0), len(data_unlbl0)))
 
         train_views = [data_train0, data_train1]
-        val_views = [data_val0, data_val1]
-        ct_model = CoTrainingModel(models)
-        states, best_val_acc_i = ct_model.train(rank, world_size, device,
-                                                iteration=c_iter, 
-                                                epochs=args.epochs,
-                                                train_views = train_views, 
-                                                val_views=val_views,
-                                                batch_size=args.batch_size,
-                                                optimizer_kwargs={'lr': args.learning_rate,
-                                                                  'momentum': args.momentum})
+        unlbl_views = [data_unlbl0, data_unlbl1]
+        loaders_val = [loader_val0, loader_val1]
+        samplers_val = [sampler_val0, sampler_val1]
+        loaders_test = [loader_test0, loader_test1]
+        samplers_test = [sampler_test0, sampler_test1]
+        best_val_acc_i, best_val_loss_i = ct_model.train(device=device,
+                                        iteration=c_iter, 
+                                        epochs=args.epochs,
+                                        states=states,
+                                        train_views=train_views,
+                                        loaders_val=loaders_val,
+                                        loaders_test=loaders_test, 
+                                        batch_size=args.batch_size,
+                                        optimizer_kwargs={'lr': args.learning_rate,
+                                                          'momentum': args.momentum},
+                                        stopper_kwargs={'metric': args.stopping_metric,
+                                                        'patience': args.patience,
+                                                        'min_delta': args.min_delta})
+        # update best val_acc
+        best_val_acc = max(best_val_acc, best_val_acc_i)
+        best_val_loss = min(best_val_loss, best_val_loss_i)
 
-        if (best_val_acc_i > best_val_acc):
-            best_val_acc = best_val_acc_i
-            best_states.update(states)
-
+        # load best states for this iteration
         for i, model in enumerate(models):
-            model.load_state_dict(best_states[f'model{i}_state'])
+            model.load_state_dict(states[f'model{i}_state'])
         
         # co-training val/test accuracy
-        c_acc_val, c_loss_val = c_test(rank, model0, model1, loader_val0, loader_val1, device)
-        c_acc_test, c_loss_test = c_test(rank, model0, model1, loader_test0, loader_test1, device)
+        c_acc_val = c_test(rank, models[0], models[1], loader_val0, loader_val1, device)
+        c_acc_test = c_test(rank, models[0], models[1], loader_test0, loader_test1, device)
 
-        # co-training update
-        cotraining_update(args, rank, world_size, 
-                          data_train0, data_train1, 
-                          data_unlbl0, data_unlbl1, 
-                          model0, model1, k, device)
+        # update datasets
+        ct_model.update(device=device,
+                        train_views=train_views, unlbl_views=unlbl_views, 
+                        num_classes=num_classes, k_total=k, 
+                        batch_size=args.batch_size)
 
         # test individual models after co-training update
-        test_acc0, test_loss0 = test_ddp(rank, device, model0, loader_test0, loss_fn)
-        test_acc1, test_loss1 = test_ddp(rank, device, model1, loader_test1, loss_fn)
+        test_acc0, test_loss0 = test_ddp(rank, device, models[0], loader_test0, loss_fn)
+        test_acc1, test_loss1 = test_ddp(rank, device, models[1], loader_test1, loss_fn)
 
         c_log = {'test_acc0': test_acc0,
                  'test_loss0': test_loss0,
@@ -274,22 +222,22 @@ def training_process(args, rank, world_size):
         c_iter_logs += ct_model.logs
         c_iter_logs[-1] = ({**c_iter_logs[-1][0], **c_log}, c_iter_logs[-1][1])
 
-        sampler_val0, loader_val0 = create_sampler_loader(args, rank, world_size, data_val0)
-        sampler_test0, loader_test0 = create_sampler_loader(args, rank, world_size, data_test0)
-        sampler_val1, loader_val1 = create_sampler_loader(args, rank, world_size, data_val1)
-        sampler_test1, loader_test1 = create_sampler_loader(args, rank, world_size, data_test1)
+        sampler_val0, loader_val0 = create_sampler_loader(rank, world_size, data_val0, args.batch_size)
+        sampler_test0, loader_test0 = create_sampler_loader(rank, world_size, data_test0, args.batch_size)
+        sampler_val1, loader_val1 = create_sampler_loader(rank, world_size, data_val1, args.batch_size)
+        sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.batch_size)
         
     dist.barrier()
 
     # wandb.finish()
 
-    return best_states, best_val_acc, c_iter_logs
+    return states, best_val_acc, c_iter_logs
 
 def main(args, rank, world_size):
 
     setup(rank, world_size)
     
-    search_space = ['k', 'percent_unlabeled']
+    search_space = ['k', 'percent_unlabeled', 'stopping_metric']
 
     agent = sync_parameters(args, rank, search_space, DistributedAsynchronousGridSearch)
 
@@ -298,6 +246,10 @@ def main(args, rank, world_size):
     states, metric, logs = training_process(args, rank, world_size)
 
     if rank == 0:
+        wandb.init(project='Co-Training v0',
+                    entity='ai2es',
+                    name=f'Co-Training',
+                    config={'args': vars(args)})
         print('saving checkpoint')
         agent.save_checkpoint(states)
         for log, epoch in logs:
@@ -325,9 +277,11 @@ def create_parser():
                         help='momentum for SGD (default: %(default)s')
     parser.add_argument('-p', '--patience', type=float, default=32,
                         help='number of epochs to train for without improvement (default: %(default)s)')
+    parser.add_argument('-md', '--min_delta', type=float, default=1e-3,
+                        help='minimum delta for early stopping metric (default: %(default)s)')
     parser.add_argument('--cotrain_iters', type=int, default=100,
                         help='max number of iterations for co-training (default: %(default)s)')
-    parser.add_argument('--k', type=float, default=[0.025],
+    parser.add_argument('--k', type=float, default=[0.05],
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.025)')
     parser.add_argument('--percent_unlabeled', type=float, default=[0.95, 0.90, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.25, 0.2, 0.15, 0.1, 0.05],
@@ -336,11 +290,11 @@ def create_parser():
                         help='percentage of samples to use for testing (default: %(default)s)')
     parser.add_argument('--percent_val', type=float, default=0.2,
                         help='percentage of labeled samples to use for validation (default: %(default)s)')
-    parser.add_argument('--stopping_metric', type=str, default='accuracy', choices=['loss', 'accuracy'],
+    parser.add_argument('--stopping_metric', type=str, default=['loss', 'accuracy'], choices=['loss', 'accuracy'],
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
-    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/tiffanyle/co-training_hparams/testing_oop',
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/tiffanyle/co-training_hparams/crash_tests',
                         help='path for hparam search directory')
     return parser
 

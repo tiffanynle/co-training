@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from torch.multiprocessing import set_start_method, set_forkserver_preload
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
@@ -15,30 +16,27 @@ class EarlyStopper:
     def __init__(self,
                  metric='accuracy',
                  patience=0,
-                 min_delta=0.0,
-                 warmup=0):
+                 min_delta=0.0):
         self.metric = metric
         self.patience = patience
         self.min_delta = min_delta
-        self.warmup = warmup
 
         self.early_stop = False
-        self.counter = 0
+        self.epochs_since_improvement = 0
         self.best_val_loss = float('inf')
         self.best_val_acc = 0.0
 
-    def step(self, epoch, val_acc, val_loss):
-        if (epoch > self.warmup):
-            self.counter += 1
-            if self.metric == 'loss' and val_loss < self.best_val_loss - self.min_delta:
-                self.best_val_loss = val_loss
-                self.best_val_acc = val_acc
-                self.counter = 0
-            elif self.metric == 'accuracy' and val_acc > self.best_val_acc + self.min_delta:
-                self.best_val_loss = val_loss
-                self.best_val_acc = val_acc
-                self.counter = 0
-        if self.counter > self.patience:
+    def step(self, val_acc, val_loss):
+        self.epochs_since_improvement += 1
+        if self.metric == 'loss' and val_loss < self.best_val_loss - self.min_delta:
+            self.best_val_loss = val_loss
+            self.best_val_acc = val_acc
+            self.epochs_since_improvement = 0
+        elif self.metric == 'accuracy' and val_acc > self.best_val_acc + self.min_delta:
+            self.best_val_loss = val_loss
+            self.best_val_acc = val_acc
+            self.epochs_since_improvement = 0
+        if self.epochs_since_improvement > self.patience:
             self.early_stop = True
 
 
@@ -54,15 +52,16 @@ def create_imagefolder(data, samples, path, transform, new_path=None):
     return imgfolder
 
 
-def create_sampler_loader(args, rank, world_size, data,
-                           cuda_kwargs={'num_workers': 12, 
-                                        'pin_memory': True, 
-                                        'shuffle': False}, 
-                                        shuffle=True):
-    sampler = DistributedSampler(data, rank=rank, 
-                                 num_replicas=world_size, shuffle=shuffle)
+def create_sampler_loader(rank, world_size, 
+                          data,
+                          batch_size=64,
+                          cuda_kwargs={'num_workers': 6, 
+                                       'pin_memory': True, 
+                                       'shuffle': False}, 
+                                       shuffle=True):
+    sampler = DistributedSampler(data, rank=rank, num_replicas=world_size, shuffle=shuffle)
 
-    loader_kwargs = {'batch_size': args.batch_size, 'sampler': sampler}
+    loader_kwargs = {'batch_size': batch_size, 'sampler': sampler}
     loader_kwargs.update(cuda_kwargs)
 
     loader = DataLoader(data, **loader_kwargs)
@@ -70,41 +69,25 @@ def create_sampler_loader(args, rank, world_size, data,
     return sampler, loader
 
 
-def get_topk_predictions(pred, k):
-    prob, label = torch.max(pred, 1)
-    idx = torch.argsort(prob, descending=True)[:k]
-    return prob[idx], label[idx], idx
+def add_to_imagefolder(paths, labels, dataset):
+    """
+    Adds the paths with the labels to an image classification dataset
 
-def predict(world_size, batch_size, loader, model, num_classes, device):
-    model.eval()
-    predictions = []
-    softmax = torch.nn.Softmax(-1)
-    with torch.no_grad():
-        for X, y in loader:
-            tensor_list = [torch.full((batch_size, num_classes), -1,
-                                      dtype=torch.float16).to(device) 
-                           for _ in range(world_size)]
-            output = softmax(model(X.to(device)))
+    :list paths: a list of absolute image paths to add to the dataset
+    :list labels: a list of labels for each path
+    :Dataset dataset: the dataset to add the samples to
+    """
 
-            # pad the output so that it contains the same 
-            # number of rows as specified by the batch size
-            pad = torch.full((batch_size, num_classes), -1, 
-                             dtype=torch.float16).to(device)
-            pad[:output.shape[0]] = output
+    new_samples = list(zip(paths, labels))
 
-            # all-gather the full list of predictions across all processes
-            dist.all_gather(tensor_list, pad)
-            batch_outputs = torch.cat(tensor_list)
+    dataset.samples += new_samples
 
-            # remove all rows of the tensor that contain a -1
-            # (as this is not a valid value anywhere)
-            mask = ~(batch_outputs == -1).any(-1)
-            batch_outputs = batch_outputs[mask]
-            predictions.append(batch_outputs)
+    return dataset
 
-    return torch.cat(predictions)
 
 def setup(rank, world_size):
+    set_start_method('forkserver')
+    set_forkserver_preload(['torch'])
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def cleanup():
