@@ -55,7 +55,7 @@ def create_imagefolder(data, samples, path, transform, new_path=None):
 def create_sampler_loader(rank, world_size, 
                           data,
                           batch_size=64,
-                          cuda_kwargs={'num_workers': 6, 
+                          cuda_kwargs={'num_workers': 4, 
                                        'pin_memory': True, 
                                        'shuffle': False}, 
                                        shuffle=True):
@@ -86,8 +86,6 @@ def add_to_imagefolder(paths, labels, dataset):
 
 
 def setup(rank, world_size):
-    set_start_method('forkserver')
-    set_forkserver_preload(['torch'])
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def cleanup():

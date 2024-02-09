@@ -378,11 +378,7 @@ class CoTrainingModel(torch.nn.Module):
 
         if lr_scheduler is not None:
             for i, opt in enumerate(optimizers):
-                schedulers.append(lr_scheduler(opt, 
-                                               'max' 
-                                               if stoppers[i].metric == 'accuracy'
-                                               else 'min')
-                                               )
+                schedulers.append(lr_scheduler(opt)) 
 
         for i in range(len(train_views)):
             sampler_train, loader_train = create_sampler_loader(self.rank, 
@@ -439,10 +435,7 @@ class CoTrainingModel(torch.nn.Module):
                 if stoppers[i].early_stop:
                     break
                 
-                if stoppers[i].metric == 'accuracy':
-                    schedulers[i].step(val_acc)
-                else:
-                    schedulers[i].step(val_loss)
+                schedulers[i].step(val_loss)
 
             iteration_logs.append(model_logs)
 
