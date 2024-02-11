@@ -91,11 +91,6 @@ def training_process(args, rank, world_size):
         train_test_split_samples(samples_train0, samples_train1,
                                 test_size=args.percent_val, random_state=13)
 
-    if rank == 0:
-        print("Length of datasets:\n Train: {} \tUnlabeled: {} \tVal: {} \tTest: {}"
-            .format(len(samples_train0), len(samples_unlbl0),
-                    len(samples_val0), len(samples_test0)))
-
     # ResNet50 wants 224x224 images
     trans = transforms.Compose([
         transforms.Resize(256),
@@ -136,17 +131,17 @@ def training_process(args, rank, world_size):
 
     ct_model = CoTrainingModel(rank, world_size, models)
 
-    sampler_val0, loader_val0 = create_sampler_loader(rank, world_size, data_val0, args.batch_size)
-    sampler_test0, loader_test0 = create_sampler_loader(rank, world_size, data_test0, args.batch_size)
+    if rank == 0:
+       wandb.init(project='co-training-refactor',
+                   entity='ai2es',
+                   name=f'Co-Training',
+                   config={'args': vars(args)})
 
-    sampler_val1, loader_val1 = create_sampler_loader(rank, world_size, data_val1, args.batch_size)
-    sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.batch_size)
-
-    # if rank == 0:
-    #     wandb.init(project='Co-Training v0',
-    #                 entity='ai2es',
-    #                 name=f'Co-Training',
-    #                 config={'args': vars(args)})
+    if rank == 0:
+        print(vars(args))
+        print("Length of datasets:\n Train: {} \tUnlabeled: {} \tVal: {} \tTest: {}"
+            .format(len(samples_train0), len(samples_unlbl0),
+                    len(samples_val0), len(samples_test0)))
 
     loss_fn = nn.CrossEntropyLoss()
 
@@ -170,6 +165,13 @@ def training_process(args, rank, world_size):
             print(f"co-training iteration: {c_iter}")
             print("train: {} unlabeled: {}"
                   .format(len(data_train0), len(data_unlbl0)))
+        
+        # persistent workers because we'll iterating through the loaders multiple times.
+        # we'll force a shutdown on the processes once we're done.
+        sampler_val0, loader_val0 = create_sampler_loader(rank, world_size, data_val0, args.batch_size, persistent_workers=True)
+        sampler_test0, loader_test0 = create_sampler_loader(rank, world_size, data_test0, args.batch_size, persistent_workers=True)
+        sampler_val1, loader_val1 = create_sampler_loader(rank, world_size, data_val1, args.batch_size, persistent_workers=True)
+        sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.batch_size, persistent_workers=True)
 
         train_views = [data_train0, data_train1]
         unlbl_views = [data_unlbl0, data_unlbl1]
@@ -197,6 +199,13 @@ def training_process(args, rank, world_size):
         # load best states for this iteration
         for i, model in enumerate(models):
             model.load_state_dict(states[f'model{i}_state'])
+
+        # recreate the samplers as I killed the processes earlier.
+        # no persistent workers as we're only iterating through it once.
+        sampler_val0, loader_val0 = create_sampler_loader(rank, world_size, data_val0, args.batch_size)
+        sampler_test0, loader_test0 = create_sampler_loader(rank, world_size, data_test0, args.batch_size)
+        sampler_val1, loader_val1 = create_sampler_loader(rank, world_size, data_val1, args.batch_size)
+        sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.batch_size)
         
         # co-training val/test accuracy
         c_acc_val = c_test(rank, models[0], models[1], loader_val0, loader_val1, device)
@@ -207,6 +216,9 @@ def training_process(args, rank, world_size):
                         train_views=train_views, unlbl_views=unlbl_views, 
                         num_classes=num_classes, k_total=k, 
                         batch_size=args.batch_size)
+
+        if rank == 0:
+            print("testing after dataset update...")
 
         # test individual models after co-training update
         test_acc0, test_loss0 = test_ddp(rank, device, models[0], loader_test0, loss_fn)
@@ -221,11 +233,6 @@ def training_process(args, rank, world_size):
         
         c_iter_logs += ct_model.logs
         c_iter_logs[-1] = ({**c_iter_logs[-1][0], **c_log}, c_iter_logs[-1][1])
-
-        sampler_val0, loader_val0 = create_sampler_loader(rank, world_size, data_val0, args.batch_size)
-        sampler_test0, loader_test0 = create_sampler_loader(rank, world_size, data_test0, args.batch_size)
-        sampler_val1, loader_val1 = create_sampler_loader(rank, world_size, data_val1, args.batch_size)
-        sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.batch_size)
         
     dist.barrier()
 
@@ -237,7 +244,7 @@ def main(args, rank, world_size):
 
     setup(rank, world_size)
     
-    search_space = ['k', 'percent_unlabeled', 'stopping_metric']
+    search_space = ['k', 'percent_unlabeled']
 
     agent = sync_parameters(args, rank, search_space, DistributedAsynchronousGridSearch)
 
@@ -246,10 +253,10 @@ def main(args, rank, world_size):
     states, metric, logs = training_process(args, rank, world_size)
 
     if rank == 0:
-        wandb.init(project='Co-Training v0',
-                    entity='ai2es',
-                    name=f'Co-Training',
-                    config={'args': vars(args)})
+        # wandb.init(project='co-training-refactor',
+        #             entity='ai2es',
+        #             name=f'Co-Training',
+        #             config={'args': vars(args)})
         print('saving checkpoint')
         agent.save_checkpoint(states)
         for log, epoch in logs:
@@ -284,17 +291,17 @@ def create_parser():
     parser.add_argument('--k', type=float, default=[0.05],
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.025)')
-    parser.add_argument('--percent_unlabeled', type=float, default=[0.95, 0.90, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.25, 0.2, 0.15, 0.1, 0.05],
+    parser.add_argument('--percent_unlabeled', type=float, default=[0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1, 0.05],
                         help='percentage of unlabeled samples to start with (default: 0.9')
     parser.add_argument('--percent_test', type=float, default=0.2,
                         help='percentage of samples to use for testing (default: %(default)s)')
     parser.add_argument('--percent_val', type=float, default=0.2,
                         help='percentage of labeled samples to use for validation (default: %(default)s)')
-    parser.add_argument('--stopping_metric', type=str, default=['loss', 'accuracy'], choices=['loss', 'accuracy'],
+    parser.add_argument('--stopping_metric', type=str, default='accuracy', choices=['loss', 'accuracy'],
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
-    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/tiffanyle/co-training_hparams/crash_tests',
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/tiffanyle/co-training_hparams/ctu',
                         help='path for hparam search directory')
     return parser
 

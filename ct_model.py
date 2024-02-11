@@ -179,7 +179,7 @@ class CoTrainingModel(torch.nn.Module):
                 "number of views and number of models must be the same -- \
                 got: train {}, unlabeled {}, models {}".format(
                     len(train_views), len(unlbl_views), len(self.models))
-        
+
         samplers_unlbl = []
         loaders_unlbl = []
         for i in range(len(unlbl_views)):
@@ -190,6 +190,9 @@ class CoTrainingModel(torch.nn.Module):
                                                                 shuffle=False)
             samplers_unlbl.append(sampler_unlbl)
             loaders_unlbl.append(loader_unlbl)
+
+        if self.rank == 0:
+            print("making predictions on unlabeled set...")
 
         # make predictions for everything in unlabeled set, for all models
         preds_softmax = []
@@ -209,6 +212,9 @@ class CoTrainingModel(torch.nn.Module):
         # we'll have each model take in top-(k // len(models)) predictions
         # (though we may bring in less than this.) (?)
         k_model = k_total // len(self.models)
+
+        if self.rank == 0:
+            print("updating datasets...")
 
         # if only 2 views, we'll filter out conflicting predictions
         # and then update the datasets by swapping labels
@@ -384,7 +390,8 @@ class CoTrainingModel(torch.nn.Module):
             sampler_train, loader_train = create_sampler_loader(self.rank, 
                                                                 self.world_size,
                                                                 train_views[i], 
-                                                                batch_size)
+                                                                batch_size,
+                                                                persistent_workers=True)
             samplers_train.append(sampler_train)
             loaders_train.append(loader_train)
 
@@ -430,13 +437,18 @@ class CoTrainingModel(torch.nn.Module):
                                   f'test_acc{i}': test_acc,
                                   f'test_loss{i}': test_loss,
                                   f'best_val_acc{i}': stoppers[i].best_val_acc,
-                                  f'best_val_loss{i}': stoppers[i].best_val_loss})
+                                  f'best_val_loss{i}': stoppers[i].best_val_loss
+                                  })
 
                 if stoppers[i].early_stop:
                     break
                 
                 schedulers[i].step(val_loss)
 
+            # need to manually shut down the workers as they will persist otherwise
+            loaders_train[i]._iterator._shutdown_workers()
+            loaders_val[i]._iterator._shutdown_workers()
+            loaders_test[i]._iterator._shutdown_workers()
             iteration_logs.append(model_logs)
 
         self.logs += merge_wandb_logs(iteration, epochs, iteration_logs)
