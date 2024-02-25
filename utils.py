@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 
+from visualization import *
+
 
 class EarlyStopper:
     def __init__(self,
@@ -286,59 +288,72 @@ def progressive_supset_sample(views: list,
     assert len(lens_views) == 1, msg3
 
     num_samples = len(views[0])
+    k_samples = k * num_samples # want to sample these many per iteration?
     labels = np.array([l for _, l in views[0]])
-    print(labels.shape)
-
+    
     # number of iterations to sample k% of datapoints
     iters = round((1 - percent_unlbl) / k)
-    print(f"iters: {iters}")
 
-    mask_train = np.zeros(num_samples, dtype=bool)
-    mask_val = np.zeros(num_samples, dtype=bool)
+    lbl_views = []
+    for i in range(len(views)):
+        lbl_views.append([])
+
+    unlbl_views = views
     for _ in range(iters):
         random.seed(random_state)
         np.random.seed(random_state)
+        idx_samples = cascade_round_subset(labels, k_samples / len(labels) 
+                                           if k_samples < len(labels) 
+                                           else k)
+        
+        # mask to remove samples
+        mask = np.ones(len(labels), dtype=bool)
+        mask[idx_samples] = False
+        
+        for i in range(len(views)):
+            samples_np = np.stack([np.array(a) for a in unlbl_views[i]])
+            samples_lbl = [(str(a[0]), int(a[1])) for a in list(samples_np[idx_samples])]
+            # no list concat cuz we eventually want to split each subset into 80/20
+            lbl_views[i].append(samples_lbl)
 
-        # retrieve indices for labeled data
-        idx_labeled = cascade_round_subset(labels, k)
+            # actually remove the samples from the view
+            unlbl_views[i] = [(str(a[0]), int(a[1])) for a in list(samples_np[mask])]
+        
+        labels = labels[mask]
 
-        random.seed(random_state) # paranoia
-
-        # split labeled data into training / validation
-        idx_val = random.sample(list(idx_labeled), floor(percent_val * len(idx_labeled)))
-        idx_train = list(set(idx_labeled) - set(idx_val))
-
-        mask_train[idx_train] = True
-        mask_val[idx_val] = True
-
-        mask_labels = np.ones(len(labels), dtype=bool)
-        mask_labels[idx_labeled] = False
-        labels = labels[mask_labels]
-
-    mask_unlbl = np.ones(num_samples, dtype=bool)
-    mask_unlbl[mask_train] = False
-    mask_unlbl[mask_val] = False 
-    
     train_views = []
     val_views = []
-    unlbl_views = []
     for i in range(len(views)):
-        view_np = np.stack([np.array(a) for a in views[i]])
+        train_views.append([])
+        val_views.append([])
 
-        train_np = view_np[mask_train]
-        val_np = view_np[mask_val]
-        unlbl_np = view_np[mask_unlbl]
+    for i in range(len(views)):
+        for partition in lbl_views[i]:
+            random.seed(random_state) # massive paranoia
+            # split partition into validation / training
+            labeled_np = np.stack([np.array(a) for a in partition])
+            idx_labeled = list(range(len(labeled_np)))
+            # mask
+            idx_val = random.sample(idx_labeled, floor(percent_val * len(idx_labeled)))
+            idx_train = list(set(idx_labeled) - set(idx_val))
+            # convert array to list for concat
+            samples_tr = [(str(a[0]), int(a[1])) for a in list(labeled_np[idx_train])]
+            samples_val = [(str(a[0]), int(a[1])) for a in list(labeled_np[idx_val])]
+            # views update
+            train_views[i] += samples_tr
+            val_views[i] += samples_val
 
-        train_view = [(str(a[0]), int(a[1]))
-                         for a in list(train_np)]
-        val_view = [(str(a[0]), int(a[1]))
-                         for a in list(val_np)]
-        unlbl_view = [(str(a[0]), int(a[1]))
-                         for a in list(unlbl_np)]
-
-        train_views.append(train_view)
-        val_views.append(val_view)
-        unlbl_views.append(unlbl_view)
-    
     return train_views, val_views, unlbl_views
+
+
+def save_reliability_diagram(view_num: int, 
+                             iteration: int,
+                             percent_unlabeled: float, 
+                             predictions: np.ndarray, 
+                             labels: np.ndarray,
+                             logits: bool = True):
+    rel_diagram = ReliabilityDiagram()
+    plt_test = rel_diagram.plot(predictions, labels, logits=logits, title="Reliability Diagram")
+    plt_test.savefig(f'plots/unlbl{percent_unlabeled}_view{view_num}_iter{iteration}.png',
+                     bbox_inches='tight')
 
