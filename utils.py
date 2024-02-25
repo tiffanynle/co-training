@@ -186,7 +186,7 @@ def train_test_split_samples(samples0, samples1, test_size, random_state=None):
 
 def train_test_split_views(views: list, 
                            test_size: float, 
-                           random_state: bool = None) -> tuple[list, list]:
+                           random_state: int = None) -> tuple[list, list]:
     if random_state is not None:
         random.seed(random_state)
 
