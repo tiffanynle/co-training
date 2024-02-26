@@ -77,9 +77,13 @@ def predict_ddp(world_size, device, model, loader, batch_size, num_classes):
             pad[:output.shape[0]] = output
 
             # same as above but we need the labels
-            label_list = [torch.full(batch_size, -1, dtype=torch.float16).to(device)]
-            pad2 = [torch.full(batch_size, -1, dtype=torch.float16).to(device)]
-            pad2[:y] = y
+            label_list = [torch.full((batch_size,), -1, 
+                                     dtype=torch.float16).to(device)
+                                     for _ in range(world_size)]
+
+            pad2 = torch.full((batch_size,), -1, 
+                               dtype=torch.float16).to(device)
+            pad2[:y.shape[0]] = y
 
             # all-gather the full list of predictions across all processes
             dist.all_gather(tensor_list, pad)
@@ -95,7 +99,6 @@ def predict_ddp(world_size, device, model, loader, batch_size, num_classes):
             batch_outputs = batch_outputs[mask]
             predictions.append(batch_outputs)
 
-            mask2 = ~(batch_labels == -1).any(-1)
             batch_labels = batch_labels[mask]
             labels.append(batch_labels)
 
@@ -194,15 +197,19 @@ class CoTrainingModel:
         # make predictions for everything in unlabeled set, for all models
         preds_softmax = []
         for i, model in enumerate(self.models):
-            pred, labels = predict_ddp(self.world_size, device, 
+            preds, labels = predict_ddp(self.world_size, device, 
                                model, loaders_unlbl[i], 
                                batch_size, 
-                               num_classes)[:len(unlbl_views[i])]
+                               num_classes)
+            preds = preds[:len(unlbl_views[i])]
+            labels = labels[:(len(unlbl_views[i]))]
             # ensure all processes agree on the list of predictions
-            dist.broadcast(pred, 0)
-            preds_softmax.append(pred)
-        
-        dist.broadcast(labels)
+            dist.broadcast(preds, 0)
+            preds_softmax.append(preds)
+        dist.broadcast(labels, 0)
+
+        if self.rank == 0:
+            print(f"shape of predictions {preds.shape} of labels {labels.shape}")
 
         # num views x num instances x num classes
         preds_softmax = torch.stack(preds_softmax)
