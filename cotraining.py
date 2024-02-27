@@ -5,6 +5,8 @@ import os
 import pickle
 import random
 from math import floor
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 import numpy as np
 import torch
@@ -22,11 +24,27 @@ from torchvision import datasets, transforms
 from torchvision.models import resnet50
 
 import metrics
+import recalibration
 import wandb
 from ct_model import *
 from DAHS.DAHB import DistributedAsynchronousGridSearch
 from DAHS.torch_utils import sync_parameters
 from utils import *
+
+import albumentations as A
+
+Atransforms = A.Compose([      
+    A.augmentations.geometric.rotate.Rotate(limit=15,p=0.5),
+    A.Perspective(scale=[0,0.1],keep_size=False,fit_output=False,p=1),
+    A.Resize(224, 224),
+    A.HorizontalFlip(p=0.5),
+    A.GaussNoise(var_limit=(10.0, 50.0), mean=0),
+    A.RandomToneCurve(scale=0.5,p=1),
+    A.augmentations.dropout.coarse_dropout.CoarseDropout()
+    ])
+
+def Atransforms_fn(img):
+    return Atransforms(image=np.array(img))['image']
 
 
 def create_model(auto_wrap_policy, device, num_classes, random_state=None):
@@ -84,11 +102,32 @@ def training_process(args, rank, world_size):
                                                                               args.percent_val,
                                                                               args.k,
                                                                               random_state=args.seed)
+    
+    unique, counts = np.unique(np.array([y for (x, y) in samples_train[0]]), return_counts=True)
+
+    with open('/ourdisk/hpc/ai2es/jroth/unlabeled_samples_lists.pkl', 'rb') as fp:
+        data_u = pickle.load(fp)
+
+
+    for j, (l, i) in enumerate(zip(data_u['labeled'], data_u['inferred'])):
+        print(j, end='\r')
+        data_u['labeled'][j] = (l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), l[1])
+        data_u['inferred'][j] = (i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), i[1])
+
+        #im = Image.open(l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
+        #im.save(l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
+        #im = Image.open(i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
+        #im.save(i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
+
+    samples_unlbl[0] += data_u['labeled']
+    samples_unlbl[1] += data_u['inferred']
 
     # ResNet50 wants 224x224 images
+
     trans = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
+        Atransforms_fn,
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                          std=[0.229, 0.224, 0.225])
@@ -129,9 +168,10 @@ def training_process(args, rank, world_size):
               'model1_state': models[1].state_dict()}
 
     ct_model = CoTrainingModel(rank, world_size, models)
+    ct_model.frequencies = counts / counts.sum()
 
     if rank == 0:
-       wandb.init(project='co-training-calibrate',
+       wandb.init(project='co-training-calibrate-jay',
                    entity='ai2es',
                    name=f'Co-Training',
                    config={'args': vars(args)})
@@ -163,6 +203,7 @@ def training_process(args, rank, world_size):
             models = [create_model(auto_wrap_policy, device, num_classes) 
                         for _ in range(num_views)]
             ct_model = CoTrainingModel(rank, world_size, models)
+            ct_model.frequencies = counts
 
         if rank == 0:
             print(f"co-training iteration: {c_iter}")
@@ -196,18 +237,18 @@ def training_process(args, rank, world_size):
         for i, model in enumerate(models):
             model.load_state_dict(states[f'model{i}_state'])
 
-        # no persistent workers as we're only iterating through it once.
-        sampler_val0, loader_val0 = create_sampler_loader(rank, world_size, data_val0, args.batch_size)
-        sampler_test0, loader_test0 = create_sampler_loader(rank, world_size, data_test0, args.batch_size)
-        sampler_val1, loader_val1 = create_sampler_loader(rank, world_size, data_val1, args.batch_size)
-        sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.batch_size)
+        # no persistent workers as we're only iterating through it a few times from here
+        sampler_val0, loader_val0 = create_sampler_loader(rank, world_size, data_val0, args.test_batch_size)
+        sampler_test0, loader_test0 = create_sampler_loader(rank, world_size, data_test0, args.test_batch_size)
+        sampler_val1, loader_val1 = create_sampler_loader(rank, world_size, data_val1, args.test_batch_size)
+        sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.test_batch_size)
         
         # co-training val/test accuracy
         c_acc_val = c_test(rank, models[0], models[1], loader_val0, loader_val1, device)
         c_acc_test = c_test(rank, models[0], models[1], loader_test0, loader_test1, device)
 
         # prediction
-        preds_softmax, labels = ct_model.predict(device, unlbl_views, num_classes, args.batch_size)
+        preds_softmax, labels = ct_model.predict(device, unlbl_views, num_classes, args.test_batch_size)
 
         if rank == 0:
             print("checking model calibration...")
@@ -227,15 +268,20 @@ def training_process(args, rank, world_size):
         if rank == 0:
             print("calibrating models...")
 
-        # recalibrate or something idk lol
+        # TODO clean this a bit
+        models[0] = recalibration.ModelWithTemperature(models[0])
+        models[0].set_temperature(world_size, device, loader_val0, args.test_batch_size, num_classes)
+
+        models[1] = recalibration.ModelWithTemperature(models[1])
+        models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
 
         # update datasets
         ct_model.update(preds_softmax, train_views, unlbl_views, k)
 
         if rank == 0:
-            print("testing after dataset update...")
+            print("testing after dataset update and calibration...")
 
-        # test individual models after co-training update
+        # test individual models after co-training update and calibration
         test_acc0, test_loss0 = test_ddp(rank, device, models[0], loader_test0, loss_fn)
         test_acc1, test_loss1 = test_ddp(rank, device, models[1], loader_test1, loss_fn)
 
@@ -287,7 +333,7 @@ def create_parser():
                         help='training epochs (default: %(default)s)')
     parser.add_argument('-b', '--batch_size', type=int, default=64, 
                         help='batch size for training (default: %(default)s)')
-    parser.add_argument('-tb', '--test_batch_size', type=int, default=64, 
+    parser.add_argument('-tb', '--test_batch_size', type=int, default=1024, 
                         help=' batch size for testing (default: %(default)s)')
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-3,
                         help='learning rate for SGD (default: %(default)s)')
@@ -302,7 +348,7 @@ def create_parser():
     parser.add_argument('--k', type=float, default=[0.05],
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.025)')
-    parser.add_argument('--percent_unlabeled', type=float, default=[0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1, 0.05],
+    parser.add_argument('--percent_unlabeled', type=float, default=[0.95, 0.9, 0.85, 0.8, 0.75],
                         help='percentage of unlabeled samples to start with (default: 0.9')
     parser.add_argument('--percent_test', type=float, default=0.2,
                         help='percentage of samples to use for testing (default: %(default)s)')
@@ -312,7 +358,7 @@ def create_parser():
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
-    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/tiffanyle/co-training_hparams/calib_tests',
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/co-training_fewshot/',
                         help='path for hparam search directory')
     parser.add_argument('--seed', type=int, default=13,
                         help='seed for random number generator (default: %(default)s)')

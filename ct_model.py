@@ -148,9 +148,22 @@ def c_test(rank, model0, model1, loader0, loader1, device):
     return test_acc
 
 
-def get_topk(prediction, k):
+def get_topk(prediction, k, frequencies):
     prob, label = torch.max(prediction, 1)
-    idx = torch.argsort(prob, descending=True)[:k]
+
+    unique, counts = np.unique(label.cpu().numpy(), return_counts=True)
+
+    counts = frequencies
+
+    count_per_class = k * (np.ones_like(frequencies) / frequencies.shape[0])
+    # ok, but this is not exactly n% we will have some rounding to do here
+    count_per_class = cascade_round(count_per_class)
+
+    idx = torch.cat([torch.argsort(prob[torch.where(label == unique[l])], descending=True)[:count_per_class[l]] for l in range(unique.shape[0])])
+
+    unique, counts = np.unique(label[idx].cpu().numpy(), return_counts=True)
+    print(counts, frequencies)
+
     return prob[idx], label[idx], idx
 
 
@@ -178,6 +191,7 @@ class CoTrainingModel:
         self.world_size = world_size
         self.models = models
         self.logs = []
+        self.frequencies = np.array([])
 
     def predict(self, device, unlbl_views, num_classes, batch_size):
         samplers_unlbl = []
@@ -242,10 +256,10 @@ class CoTrainingModel:
             for pred in preds_softmax:
                 _, lbl_topk, idx_topk = get_topk(pred,
                                                  k_model if k_model <= len(pred)
-                                                 else len(pred))
+                                                 else len(pred), self.frequencies)
                 lbls_topk.append(lbl_topk.detach().cpu().numpy())
                 idxes_topk.append(idx_topk.detach().cpu().numpy())
-            
+
             self._resolve_conflicts_twoview(lbls_topk, idxes_topk)
             self._update_datasets_twoview(lbls_topk, idxes_topk,
                                          train_views, unlbl_views)
@@ -341,7 +355,7 @@ class CoTrainingModel:
             preds_agg = torch.prod(preds_softmax[mask_preds], dim=0) / num_views
             _, lbl_topk, idx_topk = get_topk(preds_agg, k_model 
                                              if k_model <= num_instances
-                                             else num_instances)
+                                             else num_instances, self.frequencies)
 
             # training set update
             list_samples = [str(a[0], int(a[1]))

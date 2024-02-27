@@ -254,6 +254,22 @@ def cascade_round_subset(labels, percent):
     return mask
 
 
+def stratified_pseudolabel_subset(labels, logits, percent):
+    """
+    labels: np.array of size (M, )
+    
+    return: mask of indicies to include if you want to respect stratification
+    """
+    unique, counts = np.unique(labels, return_counts=True)
+    count_per_class = (percent * counts) * (logits.shape[0] / labels.shape[0])
+    # ok, but this is not exactly n% we will have some rounding to do here
+    count_per_class = cascade_round(count_per_class)
+
+    mask = np.hstack([np.where(labels == unique[l])[0][np.argsort(np.max(torch.nn.Softmax(logits), -1))][:count_per_class[l]] for l in range(unique.shape[0])])
+
+    return mask
+
+
 def progressive_supset_sample(views: list, 
                               percent_unlbl: float,
                               percent_val: float,
