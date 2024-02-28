@@ -157,9 +157,12 @@ def get_topk(prediction, k, frequencies):
 
     count_per_class = k * (np.ones_like(frequencies) / frequencies.shape[0])
     # ok, but this is not exactly n% we will have some rounding to do here
-    count_per_class = cascade_round(count_per_class)
+    idx = []
+    while len(idx) < k:
+        idx = torch.cat([torch.argsort(prob[torch.where(label == l)], descending=True)[:cascade_round(count_per_class)[l]] for l in unique])
+        count_per_class += (1 / frequencies.shape[0])
 
-    idx = torch.cat([torch.argsort(prob[torch.where(label == unique[l])], descending=True)[:count_per_class[l]] for l in range(unique.shape[0])])
+    assert len(idx) == k
 
     unique, counts = np.unique(label[idx].cpu().numpy(), return_counts=True)
     print(counts, frequencies)
@@ -429,7 +432,7 @@ class CoTrainingModel:
                                                               test_views, batch_size, 
                                                               persistent_workers=True)
 
-        loss_fn = nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss(weight=(-1*torch.log(torch.tensor(self.frequencies))))
 
         best_val_acc = 0.0
         best_val_loss = float('inf')
