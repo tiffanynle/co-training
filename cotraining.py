@@ -244,18 +244,16 @@ def training_process(args, rank, world_size):
         sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.test_batch_size)
         
         # co-training val/test accuracy
-        c_acc_val = c_test(rank, models[0], models[1], loader_val0, loader_val1, device)
-        c_acc_test = c_test(rank, models[0], models[1], loader_test0, loader_test1, device)
-
-        # prediction
-        preds_softmax, labels = ct_model.predict(device, unlbl_views, num_classes, args.test_batch_size)
+        c_acc_val = c_test(rank, ct_model.models[0], ct_model.models[1], loader_val0, loader_val1, device)
+        c_acc_test = c_test(rank, ct_model.models[0], ct_model.models[1], loader_test0, loader_test1, device)
 
         if rank == 0:
             print("checking model calibration...")
 
         # calibration measurements
+        preds_softmax_val = ct_model.predict(device, val_views, num_classes, args.test_batch_size)
         calibration_logs = {}
-        for i, preds in enumerate(preds_softmax):
+        for i, preds in enumerate(preds_softmax_val):
             preds_np = preds.detach().cpu().numpy()
             lbls_np = labels.detach().cpu().numpy().astype(int)
             ece_loss = ece_criterion.loss(preds_np, lbls_np, logits=False)
@@ -265,15 +263,18 @@ def training_process(args, rank, world_size):
                                      f'ace_loss{i}': ace_loss,
                                      f'mace_loss{i}': mace_loss})
         
-        if rank == 0:
-            print("calibrating models...")
+        if args.calibrate:
+            if rank == 0:
+                print("calibrating models...")
 
-        # TODO clean this a bit
-        models[0] = recalibration.ModelWithTemperature(models[0])
-        models[0].set_temperature(world_size, device, loader_val0, args.test_batch_size, num_classes)
+            ct_model.models[0] = recalibration.ModelWithTemperature(ct_model.models[0])
+            ct_model.models[0].set_temperature(world_size, device, loader_val0, args.test_batch_size, num_classes)
 
-        models[1] = recalibration.ModelWithTemperature(models[1])
-        models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
+            ct_model.models[1] = recalibration.ModelWithTemperature(ct_model.models[1])
+            ct_model.models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
+        
+        # prediction
+        preds_softmax, labels = ct_model.predict(device, unlbl_views, num_classes, args.test_batch_size)
 
         # update datasets
         ct_model.update(preds_softmax, train_views, unlbl_views, k)
@@ -282,8 +283,8 @@ def training_process(args, rank, world_size):
             print("testing after dataset update and calibration...")
 
         # test individual models after co-training update and calibration
-        test_acc0, test_loss0 = test_ddp(rank, device, models[0], loader_test0, loss_fn)
-        test_acc1, test_loss1 = test_ddp(rank, device, models[1], loader_test1, loss_fn)
+        test_acc0, test_loss0 = test_ddp(rank, device, ct_model.models[0], loader_test0, loss_fn)
+        test_acc1, test_loss1 = test_ddp(rank, device, ct_model.models[1], loader_test1, loss_fn)
 
         c_log = {'test_acc0': test_acc0,
                  'test_loss0': test_loss0,
@@ -347,7 +348,7 @@ def create_parser():
                         help='max number of iterations for co-training (default: %(default)s)')
     parser.add_argument('--k', type=float, default=[0.05],
                         help='percentage of unlabeled samples to bring in each \
-                            co-training iteration (default: 0.025)')
+                            co-training iteration (default: 0.05)')
     parser.add_argument('--percent_unlabeled', type=float, default=[0.95, 0.9, 0.85, 0.8, 0.75],
                         help='percentage of unlabeled samples to start with (default: 0.9')
     parser.add_argument('--percent_test', type=float, default=0.2,
@@ -358,6 +359,8 @@ def create_parser():
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
+    parser.add_argument('--calibrate', action='store_true',
+                        help='whether to calibrate models before making predictions (default: False)')
     parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/co-training_fewshot/',
                         help='path for hparam search directory')
     parser.add_argument('--seed', type=int, default=13,
