@@ -246,9 +246,19 @@ def training_process(args, rank, world_size):
         # co-training val/test accuracy
         c_acc_val = c_test(rank, ct_model.models[0], ct_model.models[1], loader_val0, loader_val1, device)
         c_acc_test = c_test(rank, ct_model.models[0], ct_model.models[1], loader_test0, loader_test1, device)
+        
+        if args.calibrate:
+            if rank == 0:
+                print("calibrating models...")
+
+            ct_model.models[0] = recalibration.ModelWithTemperature(ct_model.models[0])
+            ct_model.models[0].set_temperature(world_size, device, loader_val0, args.test_batch_size, num_classes)
+
+            ct_model.models[1] = recalibration.ModelWithTemperature(ct_model.models[1])
+            ct_model.models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
 
         if rank == 0:
-            print("checking model calibration...")
+            print("checking model calibration after temperature scaling...")
 
         # calibration measurements
         preds_softmax_val = ct_model.predict(device, val_views, num_classes, args.test_batch_size)
@@ -262,16 +272,6 @@ def training_process(args, rank, world_size):
             calibration_logs.update({f'ece_loss{i}': ece_loss,
                                      f'ace_loss{i}': ace_loss,
                                      f'mace_loss{i}': mace_loss})
-        
-        if args.calibrate:
-            if rank == 0:
-                print("calibrating models...")
-
-            ct_model.models[0] = recalibration.ModelWithTemperature(ct_model.models[0])
-            ct_model.models[0].set_temperature(world_size, device, loader_val0, args.test_batch_size, num_classes)
-
-            ct_model.models[1] = recalibration.ModelWithTemperature(ct_model.models[1])
-            ct_model.models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
         
         # prediction
         preds_softmax, labels = ct_model.predict(device, unlbl_views, num_classes, args.test_batch_size)
