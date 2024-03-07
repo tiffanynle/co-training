@@ -361,15 +361,3 @@ def progressive_supset_sample(views: list,
 
     return train_views, val_views, unlbl_views
 
-
-def save_reliability_diagram(view_num: int, 
-                             iteration: int,
-                             percent_unlabeled: float, 
-                             predictions: np.ndarray, 
-                             labels: np.ndarray,
-                             logits: bool = True):
-    rel_diagram = ReliabilityDiagram()
-    plt_test = rel_diagram.plot(predictions, labels, logits=logits, title="Reliability Diagram")
-    plt_test.savefig(f'plots/unlbl{percent_unlabeled}_view{view_num}_iter{iteration}.png',
-                     bbox_inches='tight')
-
