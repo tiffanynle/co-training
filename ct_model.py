@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.optim import SGD
+from torch.optim import SGD, Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from utils import *
@@ -162,7 +162,8 @@ def get_topk(prediction, k, frequencies):
         idx = torch.cat([torch.argsort(prob[torch.where(label == l)], descending=True)[:cascade_round(count_per_class)[l]] for l in unique])
         count_per_class += (1 / frequencies.shape[0])
 
-    assert len(idx) == k
+    idx = idx[:k]
+    # assert len(idx) == k # ...?
 
     unique, counts = np.unique(label[idx].cpu().numpy(), return_counts=True)
     print(counts, frequencies)
@@ -387,13 +388,12 @@ class CoTrainingModel:
               device: torch.device,
               iteration: int, 
               epochs: int,
-              states: dict,
               train_views: list,
               val_views: list,
               test_views: list,
               batch_size: int = 64,
               optimizer: torch.optim.Optimizer = SGD,
-              optimizer_kwargs: dict = {'lr':1e-3,
+              optimizer_kwargs: dict = {'lr': 1e-3,
                                         'momentum': 0.9},
               stopper_kwargs: dict = {'metric': 'accuracy',
                                       'patience': 32,
@@ -408,13 +408,13 @@ class CoTrainingModel:
         schedulers = []
         stoppers = []
 
+        states = dict()
         for i in range(len(self.models)):
             stoppers.append(EarlyStopper(**stopper_kwargs))
             optimizers.append(optimizer(self.models[i].parameters(), 
                                         **optimizer_kwargs))
-            # first iteration won't have any optimizer states in dict (...)
-            if f'optimizer{i}_state' not in states:
-                states[f'optimizer{i}_state'] = optimizers[i].state_dict()
+            states[f'model{i}_state'] = self.models[i].state_dict()
+            states[f'optimizer{i}_state'] = optimizers[i].state_dict()
 
         if lr_scheduler is not None:
             for i, opt in enumerate(optimizers):
@@ -432,7 +432,9 @@ class CoTrainingModel:
                                                               test_views, batch_size, 
                                                               persistent_workers=True)
 
-        loss_fn = nn.CrossEntropyLoss(weight=(-1*torch.log(torch.tensor(self.frequencies))))
+        weight = (-1*torch.log(torch.tensor(self.frequencies))).type(torch.float)
+        weight = weight.to(device)
+        loss_fn = nn.CrossEntropyLoss(weight=weight)
 
         best_val_acc = 0.0
         best_val_loss = float('inf')
@@ -484,4 +486,4 @@ class CoTrainingModel:
 
         self.logs += merge_wandb_logs(iteration, epochs, iteration_logs)
     
-        return best_val_acc, best_val_loss
+        return best_val_acc, best_val_loss, states

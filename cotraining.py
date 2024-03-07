@@ -2,6 +2,8 @@ import argparse
 import functools
 import gc
 import os
+import time
+import shutil
 import pickle
 import random
 from math import floor
@@ -16,7 +18,7 @@ import torch.optim as optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import (enable_wrap,
                                          size_based_auto_wrap_policy, wrap)
-from torch.optim import SGD
+from torch.optim import SGD, Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -108,12 +110,36 @@ def training_process(args, rank, world_size):
     with open('/ourdisk/hpc/ai2es/jroth/unlabeled_samples_lists.pkl', 'rb') as fp:
         data_u = pickle.load(fp)
 
+    if rank == 0:
+        os.mkdir(os.environ['LSCRATCH'] + '/data')
+        shutil.copytree('/ourdisk/hpc/ai2es/jroth/data/labeled', os.environ['LSCRATCH'] + '/data/labeled')
+        shutil.copy('/ourdisk/hpc/ai2es/jroth/data/NYSDOT_m4er5dez4ab.tar.gz', os.environ['LSCRATCH'] + '/data/NYSDOT_m4er5dez4ab.tar.gz')
+        shutil.copy('/ourdisk/hpc/ai2es/jroth/data/Skyline_6464.tar.gz', os.environ['LSCRATCH'] + '/data/Skyline_6464.tar.gz')
+        print('copied')
+        os.system(f"tar -xzf {os.environ['LSCRATCH'] + '/data/NYSDOT_m4er5dez4ab.tar.gz'} -C {os.environ['LSCRATCH'] + '/data/'}")
+        os.system(f"tar -xzf {os.environ['LSCRATCH'] + '/data/Skyline_6464.tar.gz'} -C {os.environ['LSCRATCH'] + '/data/'}")
+        print('extracted')
+        os.system("touch done.txt")
+    else:
+        while not os.path.isfile("done.txt"):
+            time.sleep(10)
+    # shutil.copy(Skyline_6464.tar.gz)
+
+    for k, s in enumerate(samples_train):
+        scratch = os.environ['LSCRATCH'] + '/'
+        for i, (x, y) in enumerate(s):
+            s[i] = (x.replace('/ourdisk/hpc/ai2es/jroth/', os.environ['LSCRATCH'] + '/'), y)
+        samples_train[k] = s
 
     for j, (l, i) in enumerate(zip(data_u['labeled'], data_u['inferred'])):
         print(j, end='\r')
-        data_u['labeled'][j] = (l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), l[1])
-        data_u['inferred'][j] = (i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), i[1])
-
+        scratch = os.environ['LSCRATCH'] + '/'
+        # scratch = '/ourdisk/hpc/ai2es/jroth/'
+        # shutil.copy(l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), l[0].replace('./', scratch))
+        data_u['labeled'][j] = (l[0].replace('./', scratch), l[1])
+        # shutil.copy(i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), i[0].replace('./', scratch))
+        data_u['inferred'][j] = (i[0].replace('./', scratch), i[1])
+        
         #im = Image.open(l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
         #im.save(l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
         #im = Image.open(i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
@@ -164,14 +190,11 @@ def training_process(args, rank, world_size):
     models = [create_model(auto_wrap_policy, device, num_classes) 
                 for _ in range(num_views)]
 
-    states = {'model0_state': models[0].state_dict(),
-              'model1_state': models[1].state_dict()}
-
     ct_model = CoTrainingModel(rank, world_size, models)
     ct_model.frequencies = counts / counts.sum()
 
     if rank == 0:
-       wandb.init(project='co-training-calibrate-jay',
+       wandb.init(project='co-training-calibrate',
                    entity='ai2es',
                    name=f'Co-Training',
                    config={'args': vars(args)})
@@ -181,6 +204,10 @@ def training_process(args, rank, world_size):
         print("Length of datasets:\n Train: {} \tUnlabeled: {} \tVal: {} \tTest: {}"
             .format(len(samples_train[0]), len(samples_unlbl[0]),
                     len(samples_val[0]), len(samples_test[0])))
+        _, val_counts = np.unique(np.array([y for (x, y) in samples_val[0]]), return_counts=True)
+        _, test_counts = np.unique(np.array([y for (x, y) in samples_test[0]]), return_counts=True)
+        print("frequencies for train: {}\t validation: {}\t test: {}"
+              .format(ct_model.frequencies, val_counts / val_counts.sum(), test_counts / test_counts.sum()))
 
     loss_fn = nn.CrossEntropyLoss()
 
@@ -213,22 +240,23 @@ def training_process(args, rank, world_size):
         train_kwargs = {'device': device,
                         'iteration': c_iter,
                         'epochs': args.epochs,
-                        'states': states,
                         'train_views': train_views,
                         'val_views': val_views,
                         'test_views': test_views,
                         'batch_size': args.batch_size}
         
         opt_kwargs = {'lr': args.learning_rate, 
-                            'momentum': args.momentum}
+                      #'momentum': args.momentum
+                      }
         
         stopper_kwargs = {'metric': args.stopping_metric,
                            'patience': args.patience,
                            'min_delta': args.min_delta}
         
-        best_val_acc_i, best_val_loss_i = ct_model.train(**train_kwargs, 
-                                                         optimizer_kwargs=opt_kwargs, 
-                                                         stopper_kwargs=stopper_kwargs)
+        best_val_acc_i, best_val_loss_i, states = ct_model.train(**train_kwargs,
+                                                                 optimizer=Adam, 
+                                                                 optimizer_kwargs=opt_kwargs, 
+                                                                 stopper_kwargs=stopper_kwargs)
         # update best val_acc
         best_val_acc = max(best_val_acc, best_val_acc_i)
         best_val_loss = min(best_val_loss, best_val_loss_i)
@@ -258,14 +286,14 @@ def training_process(args, rank, world_size):
             ct_model.models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
 
         if rank == 0:
-            print("checking model calibration after temperature scaling...")
+            print("checking model calibration...")
 
         # calibration measurements
-        preds_softmax_val = ct_model.predict(device, val_views, num_classes, args.test_batch_size)
+        preds_softmax_val, labels_val = ct_model.predict(device, val_views, num_classes, args.test_batch_size)
         calibration_logs = {}
         for i, preds in enumerate(preds_softmax_val):
             preds_np = preds.detach().cpu().numpy()
-            lbls_np = labels.detach().cpu().numpy().astype(int)
+            lbls_np = labels_val.detach().cpu().numpy().astype(int)
             ece_loss = ece_criterion.loss(preds_np, lbls_np, logits=False)
             ace_loss = ace_criterion.loss(preds_np, lbls_np, logits=False)
             mace_loss = mace_criterion.loss(preds_np, lbls_np, logits=False)
@@ -274,7 +302,7 @@ def training_process(args, rank, world_size):
                                      f'mace_loss{i}': mace_loss})
         
         # prediction
-        preds_softmax, labels = ct_model.predict(device, unlbl_views, num_classes, args.test_batch_size)
+        preds_softmax, _ = ct_model.predict(device, unlbl_views, num_classes, args.test_batch_size)
 
         # update datasets
         ct_model.update(preds_softmax, train_views, unlbl_views, k)
@@ -349,7 +377,7 @@ def create_parser():
     parser.add_argument('--k', type=float, default=[0.05],
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.05)')
-    parser.add_argument('--percent_unlabeled', type=float, default=[0.95, 0.9, 0.85, 0.8, 0.75],
+    parser.add_argument('--percent_unlabeled', type=float, default=[0.95, 0.9, 0.85, 0.8],
                         help='percentage of unlabeled samples to start with (default: 0.9')
     parser.add_argument('--percent_test', type=float, default=0.2,
                         help='percentage of samples to use for testing (default: %(default)s)')
@@ -361,7 +389,7 @@ def create_parser():
                         help='whether to train a new model every co-training iteration (default: False)')
     parser.add_argument('--calibrate', action='store_true',
                         help='whether to calibrate models before making predictions (default: False)')
-    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/co-training_fewshot/',
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/tiffanyle/co-training_hparams/tscale',
                         help='path for hparam search directory')
     parser.add_argument('--seed', type=int, default=13,
                         help='seed for random number generator (default: %(default)s)')
